@@ -9,6 +9,7 @@ export interface MainViewState {
   hasExplicitRunsettings: boolean;
   filter: string;
   skipPreBreakpoint: boolean;
+  notFoundTests: string[];
 }
 
 export type MainViewAction =
@@ -23,7 +24,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     runsettingsIsDefault: false,
     hasExplicitRunsettings: false,
     filter: '',
-    skipPreBreakpoint: true
+    skipPreBreakpoint: true,
+    notFoundTests: []
   };
 
   constructor(private readonly onAction: (action: MainViewAction) => void) {}
@@ -68,7 +70,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       runsettingsFull: s.runsettingsPath,
       hasExplicitRunsettings: s.hasExplicitRunsettings,
       filter: s.filter,
-      skipPreBreakpoint: s.skipPreBreakpoint
+      skipPreBreakpoint: s.skipPreBreakpoint,
+      notFoundTests: s.notFoundTests
     });
   }
 }
@@ -126,6 +129,10 @@ function renderHtml(): string {
   .section .name.empty { opacity: 0.6; font-style: italic; }
   .toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .toggle input { margin: 0; }
+  .not-found { border-top: 1px solid var(--vscode-panel-border); padding-top: 8px; }
+  .not-found .label { font-weight: 600; }
+  .not-found-list { margin-top: 4px; opacity: 0.8; }
+  .not-found-item { overflow-wrap: anywhere; padding: 2px 0; }
 </style>
 </head>
 <body>
@@ -155,6 +162,10 @@ function renderHtml(): string {
       <input type="checkbox" id="skipPreBreakpoint"/>
       <span class="label">Skip pre-breakpoint</span>
     </label>
+  </div>
+  <div class="not-found" id="notFoundSection" hidden>
+    <div class="label">Playlist tests not found in solution</div>
+    <div class="not-found-list" id="notFoundList"></div>
   </div>
 <script>
   const vscode = acquireVsCodeApi();
@@ -189,6 +200,19 @@ function renderHtml(): string {
     }
   }
 
+  function setNotFoundTests(tests) {
+    const section = $('notFoundSection');
+    const list = $('notFoundList');
+    list.replaceChildren();
+    section.hidden = !tests || tests.length === 0;
+    (tests || []).forEach(test => {
+      const item = document.createElement('div');
+      item.className = 'not-found-item';
+      item.textContent = test;
+      list.appendChild(item);
+    });
+  }
+
   window.addEventListener('message', event => {
     const s = event.data;
     if (s.type !== 'state') { return; }
@@ -202,6 +226,7 @@ function renderHtml(): string {
     $('selectRunsettings').disabled = !s.solutionReady;
     $('clearRunsettings').disabled = !s.hasExplicitRunsettings;
     $('skipPreBreakpoint').checked = !!s.skipPreBreakpoint;
+    setNotFoundTests(s.notFoundTests);
   });
 
   vscode.postMessage({ type: 'ready' });

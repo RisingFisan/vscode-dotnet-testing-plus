@@ -5,7 +5,6 @@ import * as path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 import { XMLParser } from 'fast-xml-parser';
 import { log, logCommand } from './logger';
-import { NOT_FOUND_ID } from './testTree';
 import { SourceLocation } from './sourceScan';
 
 const CHUNK_SIZE = 100;
@@ -59,7 +58,7 @@ export async function runPlaylistTests(
         item.children.forEach(enqueue);
         return;
       }
-      if (item.id.startsWith(`${NOT_FOUND_ID}:`) || excluded.has(item)) {
+      if (excluded.has(item)) {
         run.skipped(item);
         return;
       }

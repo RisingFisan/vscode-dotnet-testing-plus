@@ -2,10 +2,14 @@
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
   "description": "Filter, run, and debug .NET tests using a Visual Studio .playlist file, advanced filters, and more.",
-  "version": "1.8.3",
+  "version": "1.8.5",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RisingFisan/vscode-dotnet-testing-plus.git"
+  },
   "engines": {
     "vscode": "^1.94.0"
   },

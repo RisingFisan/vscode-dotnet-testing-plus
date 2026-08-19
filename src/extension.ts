@@ -8,7 +8,7 @@ import { parseSolution } from './solutionParser';
 import { resolveSolutionSilently, pickSolutionInteractively } from './solutionManager';
 import { discoverSolutionTests, stripTestParameters } from './solutionDiscovery';
 import { buildMethodIndex, SourceLocation } from './sourceScan';
-import { buildTree, PLACEHOLDER_ID, NOT_FOUND_ID } from './testTree';
+import { buildTree, filterTree, PLACEHOLDER_ID } from './testTree';
 import { initLogger, showLog, log } from './logger';
 import { MainViewProvider, MainViewAction } from './mainView';
 import { TestFilter, parseTestFilter, filterEntries } from './testFilter';
@@ -39,10 +39,14 @@ let reloadTimer: NodeJS.Timeout | undefined;
 let discoveryCts: vscode.CancellationTokenSource | undefined;
 let testLocations: Map<string, SourceLocation> = new Map();
 let testProjects: Map<string, string> = new Map();
+let notFoundTests: string[] = [];
+// True when the controller tree was pruned by a playlist (or replaced by a
+// placeholder) and must be rebuilt before it can be filtered again.
+let treeIsPruned = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.8.3, solution-based discovery)');
+  log('Extension activated (v1.8.5, solution-based discovery)');
   extensionPath = context.extensionPath;
 
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -163,6 +167,7 @@ function updateViewState(): void {
     runsettingsIsDefault: runsettingsPath === undefined && effective !== undefined,
     hasExplicitRunsettings: runsettingsPath !== undefined,
     filter: activeFilter?.raw ?? '',
+    notFoundTests,
     skipPreBreakpoint: vscode.workspace
       .getConfiguration('dotnetTestingPlus')
       .get<boolean>('skipPreBreakpoint', true)
@@ -205,6 +210,7 @@ function applyFilterInput(text: string): void {
 }
 
 function showPlaceholder(message: string): void {
+  treeIsPruned = true;
   controller.items.replace([controller.createTestItem(PLACEHOLDER_ID, message)]);
 }
 
@@ -258,6 +264,7 @@ async function chooseSolution(context: vscode.ExtensionContext): Promise<void> {
   runsettingsPath = undefined;
   testLocations = new Map();
   testProjects = new Map();
+  notFoundTests = [];
   await context.workspaceState.update(SOLUTION_PATH_KEY, picked);
   await context.workspaceState.update(PLAYLIST_PATH_KEY, undefined);
   await context.workspaceState.update(RUNSETTINGS_PATH_KEY, undefined);
@@ -373,7 +380,7 @@ async function discover(force: boolean): Promise<void> {
 function collectLeafItems(): vscode.TestItem[] {
   const leaves: vscode.TestItem[] = [];
   const walk = (item: vscode.TestItem): void => {
-    if (item.id === PLACEHOLDER_ID || item.id === NOT_FOUND_ID || item.id.startsWith(`${NOT_FOUND_ID}:`)) {
+    if (item.id === PLACEHOLDER_ID) {
       return;
     }
     if (item.children.size === 0) {
@@ -466,6 +473,7 @@ async function selectPlaylist(context: vscode.ExtensionContext): Promise<void> {
 async function clearPlaylist(context: vscode.ExtensionContext): Promise<void> {
   playlistPath = undefined;
   playlistEntries = [];
+  notFoundTests = [];
   playlistWatcher?.close();
   playlistWatcher = undefined;
   await context.workspaceState.update(PLAYLIST_PATH_KEY, undefined);
@@ -563,32 +571,49 @@ function matchPlaylist(): void {
   try {
     playlistEntries = parsePlaylist(fs.readFileSync(playlistPath, 'utf8'));
   } catch (err) {
+    notFoundTests = [];
+    updateViewState();
     vscode.window.showErrorMessage(`Failed to parse playlist: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
 
   if (playlistEntries.length === 0) {
+    notFoundTests = [];
+    updateViewState();
     showPlaceholder('Playlist contains no tests');
     return;
   }
 
-  buildTree(controller, playlistPath, filterEntries(playlistEntries, activeFilter), knownTests, testLocations);
+  const entries = filterEntries(playlistEntries, activeFilter);
+  notFoundTests = entries
+    .filter(entry => !knownTests!.has(entry.fullyQualifiedName))
+    .map(entry => entry.fullyQualifiedName);
+  const visible = new Set(
+    entries
+      .filter(entry => knownTests!.has(entry.fullyQualifiedName))
+      .map(entry => entry.fullyQualifiedName)
+  );
+
+  // The playlist only filters the full solution tree; it never rebuilds it,
+  // so the project grouping stays identical and surviving items keep their
+  // run state. Restore the full tree first if it was pruned before.
+  if (treeIsPruned) {
+    showAllTests(true);
+  }
+  filterTree(controller, visible);
+  treeIsPruned = true;
+  updateViewState();
+  vscode.window.showInformationMessage(
+    `Playlist "${path.basename(playlistPath)}": ${visible.size} test(s) matched, ${notFoundTests.length} not found in solution.`
+  );
 }
 
-function showAllTests(): void {
+function showAllTests(silent = false): void {
   if (!solutionPath || !knownTests) {
+    notFoundTests = [];
+    updateViewState();
     showPlaceholder('No solution selected - use ".NET Testing+: Select Solution"');
     return;
-  }
-
-  let projectDirs: { name: string; dir: string }[] = [];
-  try {
-    projectDirs = parseSolution(solutionPath).map(p => ({
-      name: path.basename(p.path, path.extname(p.path)),
-      dir: path.dirname(path.normalize(p.path))
-    }));
-  } catch (err) {
-    log(`Could not parse solution for project mapping: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   const entries: PlaylistTest[] = [];
@@ -609,22 +634,16 @@ function showAllTests(): void {
       }
     }
 
-    let project: string | undefined;
-    let bestDirLength = -1;
-    const loc = testLocations.get(fqn);
-    if (loc) {
-      const fileDir = path.dirname(path.normalize(loc.file));
-      for (const p of projectDirs) {
-        const matches = fileDir === p.dir || fileDir.startsWith(p.dir + path.sep);
-        if (matches && p.dir.length > bestDirLength) {
-          bestDirLength = p.dir.length;
-          project = p.name;
-        }
-      }
-    }
+    // Project ownership comes from the source scan (FQN -> owning csproj),
+    // the same mapping used to run tests per project.
+    const csproj = testProjects.get(fqn);
+    const project = csproj ? path.basename(csproj, path.extname(csproj)) : undefined;
 
     entries.push({ project, namespace, className, testName, fullyQualifiedName: fqn });
   }
 
-  buildTree(controller, solutionPath, filterEntries(entries, activeFilter), knownTests, testLocations, { sourceLabel: 'solution' });
+  notFoundTests = [];
+  treeIsPruned = false;
+  updateViewState();
+  buildTree(controller, solutionPath, filterEntries(entries, activeFilter), knownTests, testLocations, { sourceLabel: 'solution', silent });
 }
