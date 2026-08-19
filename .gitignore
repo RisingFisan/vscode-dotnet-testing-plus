@@ -5,3 +5,8 @@ logger/bin/
 logger/obj/
 .opencode/
 opencode.json
+
+# Local dummy MES-like solution used to manually test the extension
+dummy-mes/**/bin/
+dummy-mes/**/obj/
+dummy-mes/**/TestResults/

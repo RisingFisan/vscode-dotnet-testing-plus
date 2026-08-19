@@ -8,3 +8,5 @@ src/**
 logger/**
 tsconfig.json
 package-lock.json
+
+dummy-mes/**
