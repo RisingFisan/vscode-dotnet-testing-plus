@@ -46,7 +46,7 @@ let treeIsPruned = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.8.5, solution-based discovery)');
+  log('Extension activated (v1.8.6, solution-based discovery)');
   extensionPath = context.extensionPath;
 
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -540,7 +540,8 @@ async function clearRunsettings(context: vscode.ExtensionContext): Promise<void>
 
 function rebuildTree(): void {
   if (playlistPath) {
-    matchPlaylist();
+    // Re-matching for a filter change is not an initial load; stay silent.
+    matchPlaylist(true);
   } else {
     showAllTests();
   }
@@ -563,7 +564,7 @@ function watchPlaylistFile(): void {
   }
 }
 
-function matchPlaylist(): void {
+function matchPlaylist(silent = false): void {
   if (!playlistPath || !knownTests) {
     return;
   }
@@ -603,9 +604,11 @@ function matchPlaylist(): void {
   filterTree(controller, visible);
   treeIsPruned = true;
   updateViewState();
-  vscode.window.showInformationMessage(
-    `Playlist "${path.basename(playlistPath)}": ${visible.size} test(s) matched, ${notFoundTests.length} not found in solution.`
-  );
+  if (!silent) {
+    vscode.window.showInformationMessage(
+      `Playlist "${path.basename(playlistPath)}": ${visible.size} test(s) matched, ${notFoundTests.length} not found in solution.`
+    );
+  }
 }
 
 function showAllTests(silent = false): void {
