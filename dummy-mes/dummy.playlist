@@ -1,0 +1,11 @@
+<Playlist Version="2.0">
+  <Add Test="MES.E2E.Login.NotificationTests.NotificationIsShownOnLogin" />
+  <Add Test="MES.E2E.Login.NotificationTests.NotificationBadgeCountsUnread" />
+  <Add Test="MES.E2E.Login.LogoutTests.LogoutRedirectsToLogin" />
+  <Add Test="MES.E2E.Login.LogoutTests.LogoutClearsSession" />
+  <Add Test="MES.E2E.Cart.CartTests.AddItemIncreasesCount" />
+  <Add Test="MES.E2E.Cart.CartTests.RemoveItemDecreasesCount" />
+  <Add Test="MES.E2E.Checkout.CheckoutTests.CheckoutCompletesOrder" />
+  <!-- Intentionally missing from the solution: exercises "not found" reporting. -->
+  <Add Test="MES.E2E.Login.LoginTests.LoginWithValidUser" />
+</Playlist>
