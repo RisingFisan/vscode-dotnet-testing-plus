@@ -5,7 +5,7 @@
   "version": "1.8.2",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "engines": {
     "vscode": "^1.94.0"
   },

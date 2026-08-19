@@ -38,4 +38,8 @@ This view includes the following options:
 
 If you find any bugs or issues while using the extension, feel free to leave a comment and/or PR on the .NET Testing+ GitHub page, at https://github.com/RisingFisan/vscode-dotnet-testing-plus.
 
+## License
+
+This project is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html). Commercial use is permitted, but distributed modified versions and other covered works must remain under GPLv3 and include the corresponding source. See [LICENSE](LICENSE) for the complete terms.
+
 **Disclaimer**: Most of the code in this extension was written by generative AI. It was developed as a side project while working at Critical Manufacturing. The code quality may not be up to my usual standards, but it has been reviewed and tested by humans. This page was also 100% human-written.
