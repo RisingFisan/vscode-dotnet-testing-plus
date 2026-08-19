@@ -1,0 +1,10 @@
+.gitignore
+.git/**
+.vscode/**
+.opencode/**
+AGENTS.md
+opencode.json
+src/**
+logger/**
+tsconfig.json
+package-lock.json
