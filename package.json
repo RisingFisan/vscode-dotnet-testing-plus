@@ -2,7 +2,7 @@
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
   "description": "Filter, run, and debug .NET tests using a Visual Studio .playlist file, advanced filters, and more.",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "MIT",

@@ -129,6 +129,9 @@ function renderHtml(): string {
 </style>
 </head>
 <body>
+  <div class="section">
+    <span class="label">Advanced Search</span>
+  </div>
   <div class="filter-row">
     <input id="filter" type="text"
       placeholder="Filter: class:Checkout project:Web|class:Cart"

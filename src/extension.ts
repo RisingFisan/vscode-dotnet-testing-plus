@@ -42,7 +42,7 @@ let testProjects: Map<string, string> = new Map();
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.8.1, solution-based discovery)');
+  log('Extension activated (v1.8.2, solution-based discovery)');
   extensionPath = context.extensionPath;
 
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
