@@ -1,0 +1,183 @@
+{
+  "name": "dotnet-testing-plus",
+  "displayName": ".NET Testing+",
+  "description": "Filter, run, and debug .NET tests using a Visual Studio .playlist file, advanced filters, and more.",
+  "version": "1.8.1",
+  "icon": "assets/icon.png",
+  "publisher": "RisingFisan",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "activationEvents": [
+    "onView:workbench.view.testing",
+    "workspaceContains:**/*.sln",
+    "workspaceContains:**/*.csproj"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": ".NET Testing+",
+      "properties": {
+        "dotnetTestingPlus.chunkSize": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Number of tests per 'dotnet test' invocation. Lower values give more frequent result updates at the cost of extra process startup time."
+        },
+        "dotnetTestingPlus.skipPreBreakpoint": {
+          "type": "boolean",
+          "default": true,
+          "description": "When debugging, automatically continue past the test host's initial Debugger.Break() (triggered by VSTEST_HOST_DEBUG) so the run starts without a manual Continue."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "dotnet-testing-plus.selectSolution",
+        "title": "Select Solution",
+        "category": ".NET Testing+",
+        "icon": "$(file-directory)"
+      },
+      {
+        "command": "dotnet-testing-plus.switchSolution",
+        "title": "Switch Solution",
+        "category": ".NET Testing+",
+        "icon": "$(arrow-swap)",
+        "enablement": "!dotnetTestingPlus.solutionLoading"
+      },
+      {
+        "command": "dotnet-testing-plus.stopLoading",
+        "title": "Stop Loading Solution",
+        "category": ".NET Testing+",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "dotnet-testing-plus.selectPlaylist",
+        "title": "Select Playlist File...",
+        "category": ".NET Testing+",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "dotnet-testing-plus.refresh",
+        "title": "Refresh Tests",
+        "category": ".NET Testing+",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dotnet-testing-plus.clearPlaylist",
+        "title": "Clear Playlist",
+        "category": ".NET Testing+",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dotnet-testing-plus.showOutput",
+        "title": "Show Output",
+        "category": "Test Playlist Filter"
+      },
+      {
+        "command": "dotnet-testing-plus.selectRunsettings",
+        "title": "Select Runsettings File...",
+        "category": ".NET Testing+",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "dotnet-testing-plus.clearRunsettings",
+        "title": "Clear Runsettings Selection",
+        "category": ".NET Testing+",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dotnet-testing-plus.runAll",
+        "title": "Run All Playlist Tests",
+        "category": ".NET Testing+",
+        "icon": "$(run-all)",
+        "enablement": "dotnetTestingPlus.solutionReady"
+      },
+      {
+        "command": "dotnet-testing-plus.debugAll",
+        "title": "Debug All Playlist Tests",
+        "category": ".NET Testing+",
+        "icon": "$(debug-alt)",
+        "enablement": "dotnetTestingPlus.solutionReady"
+      },
+      {
+        "command": "dotnet-testing-plus.runTest",
+        "title": "Run Test",
+        "category": ".NET Testing+",
+        "icon": "$(run)"
+      },
+      {
+        "command": "dotnet-testing-plus.debugTest",
+        "title": "Debug Test",
+        "category": ".NET Testing+",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "dotnet-testing-plus.goToTest",
+        "title": "Go to Test",
+        "category": ".NET Testing+",
+        "icon": "$(go-to-file)"
+      }
+    ],
+    "views": {
+      "testing": [
+        {
+          "id": "dotnet-testing-plus.view",
+          "name": ".NET Testing+",
+          "type": "webview",
+          "icon": "$(beaker)"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "dotnet-testing-plus.selectSolution",
+          "when": "view == dotnet-testing-plus.view && !dotnetTestingPlus.hasSolution",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dotnet-testing-plus.switchSolution",
+          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.hasSolution",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dotnet-testing-plus.stopLoading",
+          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.solutionLoading",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dotnet-testing-plus.refresh",
+          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.solutionReady",
+          "group": "navigation@3"
+        },
+        {
+          "command": "dotnet-testing-plus.showOutput",
+          "when": "view == dotnet-testing-plus.view",
+          "group": "1_overflow@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.94.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.4.0"
+  }
+}
