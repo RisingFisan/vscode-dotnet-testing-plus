@@ -18,9 +18,15 @@ You can use .NET Testing+ alongside the official C# Dev Kit extension, but they 
 
 Ensure you have the `dotnet` command available on your machine.
 
+Install the extension through the official VS Code marketplace: https://marketplace.visualstudio.com/items?itemName=RisingFisan.dotnet-testing-plus
+
 ## Usage
 
-The extension includes a ".NET Testing+" view. When you first install the extension, it may end up on the "Explorer" tab by default, but it's best to move it to the "Testing" tab. This view includes the following options:
+The extension includes a ".NET Testing+" view. 
+
+**When you first install the extension, it may end up on the "Explorer" tab by default, but it's best to move it to the "Testing" tab.**
+
+This view includes the following options:
 
 - **Select Solution**: this button, in the view's tab, lets you choose the solution file to be used. If the project only has one solution file, it may choose that one by default. Otherwise, you must manually select a file.
 - **Filter**: allows you to filter tests by class/project name, using more advanced queries compared to the default VS Code search.
