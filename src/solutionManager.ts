@@ -1,67 +1,7 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import * as path from 'path';
 import { findAllSolutionFiles, findRootSolutionFiles } from './solutionParser';
 import { log } from './logger';
-
-const CS_DEVKIT_ID = 'ms-dotnettools.csdevkit';
-
-function isUsableSolutionPath(candidate: unknown): candidate is string {
-  return (
-    typeof candidate === 'string' &&
-    candidate.toLowerCase().endsWith('.sln') &&
-    fs.existsSync(candidate)
-  );
-}
-
-/**
- * Best-effort attempt to read the solution currently opened by C# Dev Kit.
- * Dev Kit exposes no public API for this, so we probe its exports for an
- * environment-state-like object. Any failure is non-fatal.
- */
-export async function detectDevKitSolution(): Promise<string | undefined> {
-  const extension = vscode.extensions.getExtension(CS_DEVKIT_ID);
-  if (!extension) {
-    log('C# Dev Kit not installed; skipping solution detection');
-    return undefined;
-  }
-
-  try {
-    if (!extension.isActive) {
-      await extension.activate();
-    }
-    const exports = extension.exports as Record<string, unknown> | undefined;
-    if (!exports) {
-      log('C# Dev Kit exposes no exports; cannot read its solution');
-      return undefined;
-    }
-
-    const candidates: unknown[] = [];
-    const environmentStateManager = exports['environmentStateManager'] as
-      | Record<string, unknown>
-      | undefined;
-    if (environmentStateManager && typeof environmentStateManager['getOpenedSolution'] === 'function') {
-      candidates.push(
-        (environmentStateManager['getOpenedSolution'] as () => unknown).call(environmentStateManager)
-      );
-    }
-    for (const key of ['getOpenedSolution', 'getCurrentSolution', 'solutionPath', 'openedSolution']) {
-      const value = exports[key];
-      candidates.push(typeof value === 'function' ? (value as () => unknown)() : value);
-    }
-
-    for (const candidate of candidates) {
-      if (isUsableSolutionPath(candidate)) {
-        log(`C# Dev Kit solution detected: ${candidate}`);
-        return candidate;
-      }
-    }
-    log('C# Dev Kit solution path not readable from its exports');
-  } catch (err) {
-    log(`C# Dev Kit solution detection failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return undefined;
-}
 
 /**
  * If exactly one .sln exists at a workspace folder root, use it.
@@ -79,10 +19,10 @@ export function detectRootSolution(): string | undefined {
 }
 
 /**
- * Silent resolution chain: C# Dev Kit -> root-level .sln. Never prompts.
+ * Silently resolve a single root-level .sln. Never prompts.
  */
 export async function resolveSolutionSilently(): Promise<string | undefined> {
-  return (await detectDevKitSolution()) ?? detectRootSolution();
+  return detectRootSolution();
 }
 
 /**
