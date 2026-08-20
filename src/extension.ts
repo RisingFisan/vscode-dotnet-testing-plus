@@ -46,7 +46,7 @@ let treeIsPruned = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.8.8, solution-based discovery)');
+  log('Extension activated (v1.9.0, solution-based discovery)');
   extensionPath = context.extensionPath;
 
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');

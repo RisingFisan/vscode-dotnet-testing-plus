@@ -141,8 +141,8 @@ function renderHtml(): string {
   </div>
   <div class="filter-row">
     <input id="filter" type="text"
-      placeholder="Filter: class:Checkout project:Web|class:Cart"
-      title="Space-separated terms are AND-ed, '|' separates OR-ed alternatives. class:/project: qualify a term; unqualified terms match the test name."/>
+      placeholder="Filter: class:Checkout & (project:Web|class:Cart)"
+      title="Spaces are ignored. '&' ANDs terms, '|' ORs them, parentheses group. class:/project: qualify a term or group; unqualified terms match the test name."/>
     <button id="clearFilter" title="Clear filter">Clear</button>
   </div>
   <div class="section">
