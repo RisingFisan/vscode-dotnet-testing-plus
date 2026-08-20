@@ -216,7 +216,9 @@ function renderHtml(): string {
   window.addEventListener('message', event => {
     const s = event.data;
     if (s.type !== 'state') { return; }
-    if (input.value !== (s.filter ?? '')) {
+    // Never stomp the input while the user is typing: state echoes carry the
+    // last *applied* filter, which lags in-progress text by the debounce.
+    if (document.activeElement !== input && input.value !== (s.filter ?? '')) {
       input.value = s.filter ?? '';
     }
     setName($('playlistName'), s.playlistName, 'No playlist selected', s.playlistFull);

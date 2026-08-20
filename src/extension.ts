@@ -46,7 +46,7 @@ let treeIsPruned = false;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.8.6, solution-based discovery)');
+  log('Extension activated (v1.8.8, solution-based discovery)');
   extensionPath = context.extensionPath;
 
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -539,11 +539,11 @@ async function clearRunsettings(context: vscode.ExtensionContext): Promise<void>
 }
 
 function rebuildTree(): void {
+  // Re-matching for a filter change is not an initial load; stay silent.
   if (playlistPath) {
-    // Re-matching for a filter change is not an initial load; stay silent.
     matchPlaylist(true);
   } else {
-    showAllTests();
+    showAllTests(true);
   }
 }
 
