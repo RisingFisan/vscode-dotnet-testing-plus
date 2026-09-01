@@ -30,8 +30,8 @@ The extension includes a ".NET Testing+" view.
 
 This view includes the following options:
 
-- **Solution tabs**: use **Add** to load one or more solution files. Each loaded solution has its own tab, playlist, advanced search filter, runsettings mode, overrides, and file watchers. **Unload** removes the selected solution. The Test Explorer keeps every loaded solution in one tree, above its projects, classes, and methods.
 - **Advanced Search**: allows you to filter tests by class/project name, using more advanced queries compared to the default VS Code search.
+- **Solution tabs**: Each loaded solution has its own options. The Test Explorer keeps every loaded solution in one tree, above its projects, classes, and methods.
 - **Playlist**: select a .playlist file, following the Visual Studio syntax, and filter the tests according to it.
 - **Runsettings**: choose how the selected solution's .runsettings file is picked via a dropdown with three modes. **Default** uses the .runsettings file in the solution directory as-is. **Override** uses that same default file as a base, but lets you override its values and add removable test-run parameters in the **Custom runsettings** section — the original file is never edited; a customized copy is generated in VS Code workspace storage, and your overrides are kept if you switch modes. **Custom** lets you select any other .runsettings file, used as-is (no overrides). If no default .runsettings file exists in the solution directory, only Custom is available.
 - **Skip pre-breakpoint**: Since this extension is not tightly integrated with VS Code, it uses the `dotnet` command to debug tests. This command creates an initial breakpoint when debugging tests, before the test starts executing. This option, enabled by default, skips that breakpoint.

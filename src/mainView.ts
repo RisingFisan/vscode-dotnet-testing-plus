@@ -124,7 +124,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       playlistName: s.playlistPath ? path.basename(s.playlistPath) : undefined,
       playlistFull: s.playlistPath,
       runsettingsName: s.runsettingsPath
-        ? path.basename(s.runsettingsPath).replace(/\.runsettings$/, '') +
+        ? path.basename(s.runsettingsPath).replace(/^(.+)\.runsettings$/i, '$1') +
           (s.runsettingsMode === 'override' ? ' (overridden)' : '')
         : undefined,
       runsettingsFull: s.runsettingsPath,
@@ -156,15 +156,15 @@ function renderHtml(): string {
     color: var(--vscode-foreground);
   }
   .filter-row { display: flex; gap: 4px; align-items: center; }
-  .tabs-wrapper { display: flex; flex-direction: column; border: 2px solid var(--vscode-panel-border) }
-   .solution-tabs { display: flex; gap: 2px; align-items: center; border-bottom: 2px solid var(--vscode-panel-border); }
-  #solutionTabs { display: flex; gap: 2px; overflow-x: auto; flex: 0 1 auto; min-width: 0; align-items: center; height: 32px; }
-  .solution-tab { display: flex; align-items: center; max-width: 180px; height: 100%; }
-  .solution-tab.active { background: var(--vscode-tab-activeBackground); color: var(--vscode-tab-activeForeground); font-weight: 600; }
+  .tabs-wrapper { display: flex; flex-direction: column; border: 2px solid var(--vscode-panel-border); border-radius: 8px;}
+   .solution-tabs { display: flex; gap: 4px; align-items: center; overflow-x: auto; border-bottom: 2px solid var(--vscode-panel-border); padding: 0 4px; }
+  #solutionTabs { display: flex; gap: 4px; flex: 0 0 auto; align-items: center; height: 32px; }
+  .solution-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 180px; height: 100%; }
+  .solution-tab.active { background: var(--vscode-tab-activeBackground); color: var(--vscode-tab-activeForeground); font-weight: bold; }
   .solution-tab-select { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: transparent; color: inherit; padding: 5px 8px; }
   .solution-tab-close { background: transparent; color: inherit; padding: 3px 5px; font-size: 1.1em; line-height: 1; }
   .solution-tab-close:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
-  #addSolution { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; font-size: 1.2em; line-height: 1; }
+  #addSolution { display: flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; font-size: 1.2em; line-height: 1; }
   .solution-tab.loading::after { content: '...'; }
   input#filter {
     flex: 1;
@@ -201,7 +201,7 @@ function renderHtml(): string {
   select#runsettingsMode:disabled { opacity: 0.5; }
   #selectRunsettings { align-self: flex-start; }
   #customRunsettingsSection { padding: 4px; }
-  .section { padding: 4px; }
+  .section { padding: 4px 8px; }
   .row { display: flex; flex-direction: row; gap: 6px; align-items: center; min-height: 32px; }
   .section .label { font-weight: 600; }
   .section .name {
@@ -214,7 +214,7 @@ function renderHtml(): string {
   .section .name.empty { opacity: 0.6; font-style: italic; }
   .toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .toggle input { margin: 0; }
-  .runsettings-zone { border-top: 1px solid var(--vscode-panel-border); border-bottom: 1px solid var(--vscode-panel-border); display: flex; flex-direction: column; gap: 4px; padding: 4px; }
+  .runsettings-zone { display: flex; flex-direction: column; gap: 4px; }
   details { padding: 0; }
   summary { cursor: pointer; font-weight: 600; }
   .custom-content { padding-top: 6px; display: flex; flex-direction: column; gap: 5px; }
@@ -230,7 +230,8 @@ function renderHtml(): string {
   .custom-warning { color: var(--vscode-editorWarning-foreground); overflow-wrap: anywhere; }
   .custom-empty { opacity: 0.7; font-style: italic; }
   #saveAsPlaylist { align-self: flex-start; }
-  .not-found { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--vscode-panel-border); }
+  .not-found { display: flex; flex-direction: column; gap: 4px; }
+  .not-found[hidden] { display: none; }
   .not-found .label { font-weight: 600; margin-top: 4px; }
   .not-found-list { margin-top: 4px; opacity: 0.8; list-style-type: disc; padding-left: 20px; display: flex; flex-direction: column; gap: 2px; }
   .not-found-item { overflow-wrap: anywhere; }

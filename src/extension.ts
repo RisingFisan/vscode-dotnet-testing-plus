@@ -77,7 +77,7 @@ let activeSessionKey: string | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.12.5, multi-solution discovery)');
+  log('Extension activated (v1.13.1, multi-solution discovery)');
   extensionContext = context;
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');

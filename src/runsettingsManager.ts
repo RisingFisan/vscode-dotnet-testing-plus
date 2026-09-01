@@ -571,12 +571,15 @@ function decodeXml(value: string): string {
 
 export function findDefaultRunsettings(solutionPath: string): string | undefined {
   const slnDir = path.dirname(solutionPath);
-  const slnName = path.basename(solutionPath, '.sln');
+  const slnFileName = path.basename(solutionPath);
+  const slnName = slnFileName.toLowerCase().endsWith('.sln')
+    ? slnFileName.slice(0, -'.sln'.length)
+    : slnFileName;
   const candidates: string[] = [];
   try {
-    for (const entry of fs.readdirSync(slnDir)) {
-      if (entry.toLowerCase().endsWith('.runsettings')) {
-        candidates.push(path.join(slnDir, entry));
+    for (const entry of fs.readdirSync(slnDir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith('.runsettings')) {
+        candidates.push(path.join(slnDir, entry.name));
       }
     }
   } catch {
@@ -587,17 +590,22 @@ export function findDefaultRunsettings(solutionPath: string): string | undefined
     return undefined;
   }
 
-  const sameBase = candidates.find(c => path.basename(c, '.runsettings').toLowerCase() === slnName.toLowerCase());
+  const sameBase = candidates.find(c => path.basename(c).slice(0, -'.runsettings'.length).toLowerCase() === slnName.toLowerCase());
   if (sameBase) {
     return sameBase;
   }
 
-  const namedDefault = candidates.find(c => path.basename(c, '.runsettings').toLowerCase() === 'default');
+  const namedDefault = candidates.find(c => path.basename(c).slice(0, -'.runsettings'.length).toLowerCase() === 'default');
   if (namedDefault) {
     return namedDefault;
   }
 
-  return candidates[0];
+  const hiddenDefault = candidates.find(c => path.basename(c).toLowerCase() === '.runsettings');
+  if (hiddenDefault) {
+    return hiddenDefault;
+  }
+
+  return candidates.sort((left, right) => left.localeCompare(right))[0];
 }
 
 export function resolveRunsettingsPath(solutionPath: string, explicitPath: string | undefined): string | undefined {
