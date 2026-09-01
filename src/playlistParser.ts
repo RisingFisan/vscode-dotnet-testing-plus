@@ -91,3 +91,17 @@ export function parsePlaylist(xml: string): PlaylistTest[] {
 
   return tests;
 }
+
+function escapeXmlAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+export function serializePlaylist(fqns: string[]): string {
+  const sorted = [...fqns].sort((a, b) => a.localeCompare(b));
+  const body = sorted.map(fqn => `  <Add Test="${escapeXmlAttr(fqn)}" />`).join('\n');
+  return `<Playlist Version="2.0">\n${body}${body ? '\n' : ''}</Playlist>\n`;
+}

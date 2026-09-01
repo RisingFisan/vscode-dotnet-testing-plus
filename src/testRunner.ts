@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 import { XMLParser } from 'fast-xml-parser';
 import { log, logCommand } from './logger';
@@ -17,6 +18,18 @@ interface TrxResult {
   durationMs?: number;
 }
 
+export interface TestDescriptor {
+  fullyQualifiedName: string;
+  solutionPath: string;
+  projectPath?: string;
+  location?: SourceLocation;
+}
+
+export interface SolutionRunOptions {
+  solutionPath: string;
+  runsettingsPath?: string;
+}
+
 interface RunOptions {
   runsettingsPath?: string;
   locations?: Map<string, SourceLocation>;
@@ -25,6 +38,8 @@ interface RunOptions {
   /** Directory containing Playlist.TestLogger.dll; enables live per-test results. */
   loggerDir?: string;
   chunkSize?: number;
+  /** Test item ID -> solution-specific test metadata. */
+  descriptors?: Map<string, TestDescriptor>;
   /** Auto-continue past the test host's initial Debugger.Break() when debugging. */
   skipPreBreakpoint?: boolean;
 }
@@ -40,93 +55,158 @@ function appendOutput(run: vscode.TestRun, text: string): void {
   run.appendOutput(text.replace(/\r?\n/g, '\r\n'));
 }
 
+/**
+ * Resolve a run request to the leaf tests to execute. `request.exclude` may
+ * contain whole subtrees (VS Code excludes the top-most hidden nodes when the
+ * explorer is filtered, e.g. "Show only failed tests"), so exclusion is
+ * checked before recursing. Excluded tests are left untouched: they keep
+ * their previous state and don't appear in the run.
+ */
+function collectTestsToRun(controller: vscode.TestController, request: vscode.TestRunRequest): vscode.TestItem[] {
+  const tests: vscode.TestItem[] = [];
+  const excluded = new Set(request.exclude ?? []);
+
+  const enqueue = (item: vscode.TestItem): void => {
+    if (excluded.has(item)) {
+      return;
+    }
+    if (item.children.size > 0) {
+      item.children.forEach(enqueue);
+      return;
+    }
+    tests.push(item);
+  };
+
+  if (request.include && request.include.length > 0) {
+    request.include.forEach(enqueue);
+  } else {
+    controller.items.forEach(enqueue);
+  }
+  return tests;
+}
+
 export async function runPlaylistTests(
   controller: vscode.TestController,
   request: vscode.TestRunRequest,
   token: vscode.CancellationToken,
   debug: boolean,
-  solutionPath: string,
+  solutions: ReadonlyMap<string, SolutionRunOptions>,
   options?: RunOptions
 ): Promise<void> {
   const run = controller.createTestRun(request);
+  // Two UI cancel paths exist: the Test Explorer's cancel fires the profile
+  // handler token, while the Test Results view's cancel only fires the
+  // TestRun's own token (it cancels a single task). Honor both.
+  const cancel = new vscode.CancellationTokenSource();
+  token.onCancellationRequested(() => cancel.cancel());
+  run.token.onCancellationRequested(() => cancel.cancel());
   try {
-    const tests: vscode.TestItem[] = [];
-    const excluded = new Set(request.exclude ?? []);
+    const tests = collectTestsToRun(controller, request);
 
-    const enqueue = (item: vscode.TestItem): void => {
-      if (item.children.size > 0) {
-        item.children.forEach(enqueue);
-        return;
+    const { groups: bySolution, unassigned } = groupTestsBySolution(tests, solutions, options);
+    unassigned.forEach(test => run.skipped(test));
+    // Map insertion order follows the requested tree order, so all work for a
+    // solution completes before the next solution is built or run.
+    for (const [solutionPath, solutionTests] of bySolution) {
+      if (cancel.token.isCancellationRequested) {
+        solutionTests.forEach(test => run.skipped(test));
+        continue;
       }
-      if (excluded.has(item)) {
-        run.skipped(item);
-        return;
-      }
-      tests.push(item);
-    };
-
-    if (request.include && request.include.length > 0) {
-      request.include.forEach(enqueue);
-    } else {
-      controller.items.forEach(enqueue);
+      const solution = solutions.get(solutionPath)!;
+      await runSolutionTests(solutionTests, solution, run, cancel.token, debug, options);
     }
-
-    const chunkSize = options?.chunkSize && options.chunkSize > 0 ? options.chunkSize : CHUNK_SIZE;
-    const projects = options?.projects;
-
-    if (projects && projects.size > 0) {
-      const groups = new Map<string, vscode.TestItem[]>();
-      const unmapped: vscode.TestItem[] = [];
-      for (const test of tests) {
-        const csproj = projects.get(test.id);
-        if (csproj) {
-          const group = groups.get(csproj) ?? [];
-          group.push(test);
-          groups.set(csproj, group);
-        } else {
-          unmapped.push(test);
-        }
-      }
-
-      if (unmapped.length > 0) {
-        const ids = unmapped.map(t => t.id).join(', ');
-        const message = `Skipping ${unmapped.length} test(s) with no owning project mapping: ${ids.slice(0, 200)}${ids.length > 200 ? '...' : ''}`;
-        log(message);
-        appendOutput(run, message + '\n');
-        unmapped.forEach(t => run.skipped(t));
-      }
-
-      if (groups.size === 0) {
-        return;
-      }
-
-      // Build once so per-project runs can use --no-build.
-      await buildSolutionOnce(solutionPath, run, token);
-
-      for (const [csproj, projectTests] of groups) {
-        if (token.isCancellationRequested) {
-          projectTests.forEach(t => run.skipped(t));
-          continue;
-        }
-        for (let i = 0; i < projectTests.length; i += chunkSize) {
-          if (token.isCancellationRequested) {
-            projectTests.slice(i).forEach(t => run.skipped(t));
-            break;
-          }
-          await runChunk(csproj, projectTests.slice(i, i + chunkSize), run, token, debug, options, true);
-        }
-      }
+  } catch (err) {
+    // A cancelled run rejects the in-flight build/chunk promises; that's
+    // expected, not an error to surface. Real failures still propagate.
+    if (cancel.token.isCancellationRequested) {
+      log('Test run cancelled');
     } else {
-      for (let i = 0; i < tests.length; i += chunkSize) {
-        if (token.isCancellationRequested) {
-          tests.slice(i).forEach(t => run.skipped(t));
-          break;
-        }
-        await runChunk(solutionPath, tests.slice(i, i + chunkSize), run, token, debug, options, false);
-      }
+      throw err;
     }
   } finally {
     run.end();
+    cancel.dispose();
+  }
+}
+
+function descriptorFor(test: vscode.TestItem, options?: RunOptions): TestDescriptor | undefined {
+  const descriptor = options?.descriptors?.get(test.id);
+  if (descriptor) {
+    return descriptor;
+  }
+  // Retain the original item-ID-as-FQN behavior for older harnesses.
+  return undefined;
+}
+
+function groupTestsBySolution(
+  tests: readonly vscode.TestItem[],
+  solutions: ReadonlyMap<string, SolutionRunOptions>,
+  options?: RunOptions
+): { groups: Map<string, vscode.TestItem[]>; unassigned: vscode.TestItem[] } {
+  const groups = new Map<string, vscode.TestItem[]>();
+  const unassigned: vscode.TestItem[] = [];
+  for (const test of tests) {
+    const descriptor = descriptorFor(test, options);
+    if (!descriptor || !solutions.has(descriptor.solutionPath)) {
+      unassigned.push(test);
+      continue;
+    }
+    const group = groups.get(descriptor.solutionPath) ?? [];
+    group.push(test);
+    groups.set(descriptor.solutionPath, group);
+  }
+  return { groups, unassigned };
+}
+
+function fqnFilter(tests: readonly vscode.TestItem[], options?: RunOptions): string {
+  return tests.map(test => `FullyQualifiedName=${descriptorFor(test, options)?.fullyQualifiedName ?? test.id}`).join('|');
+}
+
+async function runSolutionTests(
+  tests: vscode.TestItem[],
+  solution: SolutionRunOptions,
+  run: vscode.TestRun,
+  token: vscode.CancellationToken,
+  debug: boolean,
+  options?: RunOptions
+): Promise<void> {
+  const chunkSize = options?.chunkSize && options.chunkSize > 0 ? options.chunkSize : CHUNK_SIZE;
+  const groups = new Map<string, vscode.TestItem[]>();
+  const unmapped: vscode.TestItem[] = [];
+  for (const test of tests) {
+    const descriptor = descriptorFor(test, options);
+    const csproj = descriptor?.projectPath ?? options?.projects?.get(descriptor?.fullyQualifiedName ?? test.id);
+    if (!csproj) {
+      unmapped.push(test);
+      continue;
+    }
+    const group = groups.get(csproj) ?? [];
+    group.push(test);
+    groups.set(csproj, group);
+  }
+  if (unmapped.length > 0) {
+    const message = `Skipping ${unmapped.length} test(s) with no owning project mapping.`;
+    log(message);
+    appendOutput(run, message + '\n');
+    unmapped.forEach(test => run.skipped(test));
+  }
+  if (groups.size === 0) {
+    return;
+  }
+  const solutionOptions: RunOptions = { ...options, runsettingsPath: solution.runsettingsPath };
+  await buildSolutionOnce(solution.solutionPath, run, token);
+  for (const [csproj, projectTests] of groups) {
+    if (token.isCancellationRequested) {
+      projectTests.forEach(test => run.skipped(test));
+      continue;
+    }
+    for (let i = 0; i < projectTests.length; i += chunkSize) {
+      if (token.isCancellationRequested) {
+        projectTests.slice(i).forEach(test => run.skipped(test));
+        break;
+      }
+      await runChunk(csproj, projectTests.slice(i, i + chunkSize), run, token, debug, solutionOptions, true);
+    }
   }
 }
 
@@ -208,7 +288,7 @@ function reportOutcome(
           new vscode.Range(topFrame.position, topFrame.position)
         );
       } else {
-        const loc = ctx.options?.locations?.get(test.id);
+        const loc = descriptorFor(test, ctx.options)?.location ?? ctx.options?.locations?.get(test.id);
         if (loc) {
           message.location = new vscode.Location(
             vscode.Uri.file(loc.file),
@@ -236,7 +316,8 @@ function reportMatchedResults(ctx: LiveContext, results: TrxResult[]): void {
     if (ctx.reported.has(test.id)) {
       continue;
     }
-    const result = byFqn.get(test.id) ?? results.find(r => r.fqn.startsWith(test.id + '('));
+    const fqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
+    const result = byFqn.get(fqn) ?? results.find(r => r.fqn.startsWith(fqn + '('));
     if (!result) {
       continue;
     }
@@ -273,7 +354,8 @@ function reportStreamedLine(ctx: LiveContext, line: string): void {
     if (ctx.reported.has(test.id)) {
       continue;
     }
-    if (test.id !== result.fqn && !result.fqn.startsWith(test.id + '(')) {
+    const fqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
+    if (fqn !== result.fqn && !result.fqn.startsWith(fqn + '(')) {
       continue;
     }
     reportOutcome(ctx, test, result.outcome, result.durationMs, {
@@ -422,7 +504,7 @@ async function runChunk(
     run.enqueued(t);
   });
 
-  const filter = tests.map(t => `FullyQualifiedName=${t.id}`).join('|');
+  const filter = fqnFilter(tests, options);
   const args = ['test', target, '--filter', filter, '--nologo', '--logger', 'trx', '-c', 'Debug', '--tl:off'];
   if (noBuild) {
     args.push('--no-build');
@@ -441,7 +523,7 @@ async function runChunk(
   const ctx: LiveContext = { run, options, tests, reported: new Set<string>() };
   let resultFiles: string[] = [];
   const streamLogPath = useStreamLogger
-    ? path.join(os.tmpdir(), `playlist-stream-${process.pid}-${Date.now()}.jsonl`)
+    ? path.join(os.tmpdir(), `playlist-stream-${process.pid}-${Date.now()}-${crypto.randomUUID()}.jsonl`)
     : undefined;
   const stopTailer = streamLogPath ? startStreamTailer(streamLogPath, ctx) : undefined;
 
@@ -477,7 +559,12 @@ async function runChunk(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     for (const test of ctx.tests) {
-      if (!ctx.reported.has(test.id)) {
+      if (ctx.reported.has(test.id)) {
+        continue;
+      }
+      if (token.isCancellationRequested) {
+        run.skipped(test);
+      } else {
         run.errored(test, new vscode.TestMessage(message));
       }
     }
@@ -756,3 +843,6 @@ function readTrxResults(trxPath: string): TrxResult[] {
 export const __readTrxForTest = readTrxResults;
 export const __processLineForTest = processLine;
 export const __reportStreamedLineForTest = reportStreamedLine;
+export const __collectTestsToRunForTest = collectTestsToRun;
+export const __groupTestsBySolutionForTest = groupTestsBySolution;
+export const __fqnFilterForTest = fqnFilter;

@@ -3,8 +3,19 @@ import * as path from 'path';
 import { PlaylistTest } from './playlistParser';
 import { SourceLocation } from './sourceScan';
 
-export const PROJECT_ITEM_PREFIX = 'proj:';
 export const PLACEHOLDER_ID = 'placeholder';
+
+function keyPart(value: string): string {
+  return encodeURIComponent(value);
+}
+
+export function solutionItemId(solutionPath: string): string {
+  return `solution:${keyPart(solutionPath)}`;
+}
+
+export function testItemId(solutionPath: string, fullyQualifiedName: string): string {
+  return `test:${keyPart(solutionPath)}:${keyPart(fullyQualifiedName)}`;
+}
 
 function projectLabelOf(entry: PlaylistTest): string {
   if (entry.project) {
@@ -16,103 +27,76 @@ function projectLabelOf(entry: PlaylistTest): string {
   return 'Playlist';
 }
 
+function solutionLabel(solutionPath: string): string {
+  return path.basename(solutionPath, path.extname(solutionPath));
+}
+
+export interface SolutionTreeOptions {
+  locations?: Map<string, SourceLocation>;
+  projects?: Map<string, string>;
+}
+
 /**
- * Build the Testing-tab tree from the playlist entries that matched the
- * solution's known tests. Unmatched entries are reported separately by the
- * main view because every TestItem inherits the controller's run actions.
+ * Create one solution root for the shared TestController. Every item ID is
+ * scoped by the absolute solution path so identical FQNs in loaded solutions
+ * can coexist and be routed back to the right dotnet invocation.
  */
-export function buildTree(
+export function buildSolutionTree(
   controller: vscode.TestController,
-  playlistPath: string,
+  solutionPath: string,
   entries: PlaylistTest[],
   knownTests: ReadonlySet<string>,
-  locations?: Map<string, SourceLocation>,
-  options?: { sourceLabel?: string; silent?: boolean }
-): void {
-  const roots: vscode.TestItem[] = [];
+  options?: SolutionTreeOptions
+): vscode.TestItem {
+  const root = controller.createTestItem(solutionItemId(solutionPath), solutionLabel(solutionPath));
+  root.description = path.dirname(solutionPath);
   const projectItems = new Map<string, vscode.TestItem>();
-  const matched = new Set<string>();
-  const notFoundCount = entries.filter(entry => !knownTests.has(entry.fullyQualifiedName)).length;
 
   for (const entry of entries) {
     if (!knownTests.has(entry.fullyQualifiedName)) {
       continue;
     }
-    matched.add(entry.fullyQualifiedName);
-
+    const projectPath = options?.projects?.get(entry.fullyQualifiedName);
     const label = projectLabelOf(entry);
-    let projectItem = projectItems.get(label);
+    const projectId = `${root.id}:project:${keyPart(projectPath ?? label)}`;
+    let projectItem = projectItems.get(projectId);
     if (!projectItem) {
-      projectItem = controller.createTestItem(`${PROJECT_ITEM_PREFIX}${label}`, label);
-      projectItems.set(label, projectItem);
-      roots.push(projectItem);
+      projectItem = controller.createTestItem(projectId, label);
+      projectItems.set(projectId, projectItem);
+      root.children.add(projectItem);
     }
 
     const fqn = entry.fullyQualifiedName;
     const lastDot = fqn.lastIndexOf('.');
     const className = lastDot === -1 ? fqn : fqn.slice(0, lastDot);
     const testName = lastDot === -1 ? fqn : fqn.slice(lastDot + 1);
-    let classItem = projectItem.children.get(`${projectItem.id}:${className}`);
+    const classId = `${projectItem.id}:class:${keyPart(className)}`;
+    let classItem = projectItem.children.get(classId);
     if (!classItem) {
-      classItem = controller.createTestItem(`${projectItem.id}:${className}`, className);
+      classItem = controller.createTestItem(classId, className);
       projectItem.children.add(classItem);
     }
-    const loc = locations?.get(fqn);
-    const item = controller.createTestItem(fqn, testName, loc ? vscode.Uri.file(loc.file) : undefined);
+    const loc = options?.locations?.get(fqn);
+    const item = controller.createTestItem(testItemId(solutionPath, fqn), testName, loc ? vscode.Uri.file(loc.file) : undefined);
     if (loc) {
       item.range = new vscode.Range(loc.line - 1, 0, loc.line - 1, 0);
     }
     classItem.children.add(item);
   }
 
-  for (const projectItem of projectItems.values()) {
-    sortChildrenRecursively(projectItem);
-  }
-  roots.sort((a, b) => a.label.localeCompare(b.label));
-  controller.items.replace(roots);
-
-  if (options?.silent) {
-    return;
-  }
-  if (options?.sourceLabel) {
-    vscode.window.showInformationMessage(
-      `Showing ${matched.size} test(s) from ${options.sourceLabel}.`
-    );
-  } else {
-    vscode.window.showInformationMessage(
-      `Playlist "${path.basename(playlistPath)}": ${matched.size} test(s) matched, ${notFoundCount} not found in solution.`
-    );
-  }
+  sortChildrenRecursively(root);
+  return root;
 }
 
-/**
- * Prune the existing tree in place, keeping only leaf tests whose id (FQN) is
- * in `keep` and dropping class/project nodes that become empty. Used when a
- * playlist is loaded so the project grouping of the full tree is preserved
- * and surviving items keep their run state.
- */
-export function filterTree(controller: vscode.TestController, keep: ReadonlySet<string>): void {
-  const roots: vscode.TestItem[] = [];
-  controller.items.forEach(projectItem => {
-    const keptClasses: vscode.TestItem[] = [];
-    projectItem.children.forEach(classItem => {
-      const keptLeaves: vscode.TestItem[] = [];
-      classItem.children.forEach(leaf => {
-        if (keep.has(leaf.id)) {
-          keptLeaves.push(leaf);
-        }
-      });
-      classItem.children.replace(keptLeaves);
-      if (keptLeaves.length > 0) {
-        keptClasses.push(classItem);
-      }
-    });
-    projectItem.children.replace(keptClasses);
-    if (keptClasses.length > 0) {
-      roots.push(projectItem);
-    }
-  });
-  controller.items.replace(roots);
+export function buildSolutionPlaceholder(
+  controller: vscode.TestController,
+  solutionPath: string,
+  message: string
+): vscode.TestItem {
+  const root = controller.createTestItem(solutionItemId(solutionPath), solutionLabel(solutionPath));
+  root.description = path.dirname(solutionPath);
+  root.children.add(controller.createTestItem(`${root.id}:${PLACEHOLDER_ID}`, message));
+  return root;
 }
 
 function sortChildrenRecursively(item: vscode.TestItem): void {

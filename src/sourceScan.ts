@@ -6,7 +6,9 @@ const SKIP_DIRS = new Set(['bin', 'obj', 'node_modules', '.git']);
 // Class declarations anchored at line start (with modifiers) so that the
 // word "class" inside comments or strings does not create bogus segments.
 const CLASS_RE = /^\s*(?:(?:public|private|internal|protected|static|sealed|abstract|partial|new)\s+)*class\s+(\w+)/gm;
-const METHOD_RE = /\[(?:TestMethod|DataTestMethod)(?:\([^\]]*\))?(?:\s*,[^\]]*)?\][\s\S]*?(?:async\s+)?(?:void|Task(?:<\w+>)?)\s+(\w+)\s*\(/g;
+// Test attributes may be combined in either order, for example
+// [TestCategory("Smoke"), TestMethod].
+const METHOD_RE = /\[(?=[^\]]*\b(?:TestMethod|DataTestMethod)\b)[^\]]*\][\s\S]*?(?:async\s+)?(?:void|Task(?:<\w+>)?)\s+(\w+)\s*\(/g;
 const NAMESPACE_RE = /namespace\s+([\w.]+)/;
 
 function walkCsFiles(dir: string): string[] {

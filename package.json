@@ -1,8 +1,8 @@
 {
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
-  "description": "Filter, run, and debug .NET tests using a Visual Studio .playlist file, advanced filters, and more.",
-  "version": "1.9.0",
+  "description": "Filter, run, and debug tests from .NET solutions using Visual Studio playlists, advanced filters, and runsettings.",
+  "version": "1.12.5",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "GPL-3.0-only",
@@ -42,16 +42,28 @@
     "commands": [
       {
         "command": "dotnet-testing-plus.selectSolution",
-        "title": "Select Solution",
+        "title": "Add Solution",
         "category": ".NET Testing+",
         "icon": "$(file-directory)"
       },
       {
         "command": "dotnet-testing-plus.switchSolution",
-        "title": "Switch Solution",
+        "title": "Add Solution",
         "category": ".NET Testing+",
         "icon": "$(arrow-swap)",
         "enablement": "!dotnetTestingPlus.solutionLoading"
+      },
+      {
+        "command": "dotnet-testing-plus.addSolution",
+        "title": "Add Solution...",
+        "category": ".NET Testing+",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dotnet-testing-plus.removeSolution",
+        "title": "Unload Selected Solution",
+        "category": ".NET Testing+",
+        "icon": "$(close)"
       },
       {
         "command": "dotnet-testing-plus.stopLoading",
@@ -96,14 +108,14 @@
       },
       {
         "command": "dotnet-testing-plus.runAll",
-        "title": "Run All Playlist Tests",
+        "title": "Run All Loaded Solution Tests",
         "category": ".NET Testing+",
         "icon": "$(run-all)",
         "enablement": "dotnetTestingPlus.solutionReady"
       },
       {
         "command": "dotnet-testing-plus.debugAll",
-        "title": "Debug All Playlist Tests",
+        "title": "Debug All Loaded Solution Tests",
         "category": ".NET Testing+",
         "icon": "$(debug-alt)",
         "enablement": "dotnetTestingPlus.solutionReady"
@@ -140,24 +152,14 @@
     "menus": {
       "view/title": [
         {
-          "command": "dotnet-testing-plus.selectSolution",
-          "when": "view == dotnet-testing-plus.view && !dotnetTestingPlus.hasSolution",
-          "group": "navigation@1"
-        },
-        {
-          "command": "dotnet-testing-plus.switchSolution",
-          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.hasSolution",
-          "group": "navigation@1"
-        },
-        {
           "command": "dotnet-testing-plus.stopLoading",
           "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.solutionLoading",
-          "group": "navigation@2"
+          "group": "navigation@1"
         },
         {
           "command": "dotnet-testing-plus.refresh",
           "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.solutionReady",
-          "group": "navigation@3"
+          "group": "navigation@2"
         },
         {
           "command": "dotnet-testing-plus.showOutput",
