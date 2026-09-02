@@ -31,10 +31,16 @@ The extension includes a ".NET Testing+" view.
 This view includes the following options:
 
 - **Advanced Search**: allows you to filter tests by class/project name, using more advanced queries compared to the default VS Code search.
-- **Solution tabs**: Each loaded solution has its own options. The Test Explorer keeps every loaded solution in one tree, above its projects, classes, and methods.
-- **Playlist**: select a .playlist file, following the Visual Studio syntax, and filter the tests according to it.
-- **Runsettings**: choose how the selected solution's .runsettings file is picked via a dropdown with three modes. **Default** uses the .runsettings file in the solution directory as-is. **Override** uses that same default file as a base, but lets you override its values and add removable test-run parameters in the **Custom runsettings** section — the original file is never edited; a customized copy is generated in VS Code workspace storage, and your overrides are kept if you switch modes. **Custom** lets you select any other .runsettings file, used as-is (no overrides). If no default .runsettings file exists in the solution directory, only Custom is available.
-- **Skip pre-breakpoint**: Since this extension is not tightly integrated with VS Code, it uses the `dotnet` command to debug tests. This command creates an initial breakpoint when debugging tests, before the test starts executing. This option, enabled by default, skips that breakpoint.
+  - **Save As Playlist**: saves the currently visible tests in the Test Explorer in a .playlist file. Useful for keeping track, saving, and sharing test runs.
+- **Solution Manager**: load one or more .NET Solutions and run its tests. Tests from multiple solutions can be executed in the same test run. Each solution has its own settings:
+    - **Playlist**: select a .playlist file, following the Visual Studio syntax, and filter the tests according to it.
+    - **Runsettings**: choose how the selected solution's .runsettings file is picked via a dropdown with three modes.
+        - **Default** uses the .runsettings file in the solution directory as-is. 
+        - **Override** uses that same default file as a base, but lets you override its values and add more parameters.
+        - **Custom** lets you select any other .runsettings file, used as-is (no overrides). 
+    
+        If no default .runsettings file exists in the solution directory, only Custom is available.
+    - **Skip pre-breakpoint**: since this extension is not tightly integrated with VS Code, it uses the `dotnet` command to debug tests. This command creates an initial breakpoint when debugging tests, before the test starts executing. This option, enabled by default, skips that breakpoint. There should be no reason to disable it, but it's left as a choice.
 
 ## Contact
 
