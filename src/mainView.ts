@@ -77,6 +77,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         this.postState();
       } else if (msg.type === 'selectSession' && msg.key !== undefined) {
         this.onAction({ type: 'selectSession', key: msg.key });
+      } else if (msg.type === 'removeSolution' && msg.key !== undefined) {
+        this.onAction({ type: 'removeSolution', key: msg.key });
       } else if (msg.type === 'filter') {
         this.onAction({ type: 'filter', text: msg.text ?? '' });
       } else if (msg.type === 'setRunsettingsMode' && msg.mode !== undefined) {
@@ -165,7 +167,6 @@ function renderHtml(): string {
   .solution-tab-close { background: transparent; color: inherit; padding: 3px 5px; font-size: 1.1em; line-height: 1; }
   .solution-tab-close:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
   #addSolution { display: flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; font-size: 1.2em; line-height: 1; }
-  .solution-tab.loading::after { content: '...'; }
   input#filter {
     flex: 1;
     min-width: 0;
@@ -311,7 +312,7 @@ function renderHtml(): string {
        tab.title = session.detail + (session.loading ? ' (loading)' : session.ready ? ' (ready)' : '');
        const select = document.createElement('button');
        select.className = 'solution-tab-select';
-       select.textContent = session.label + (session.testCount !== undefined ? ' (' + session.testCount + ')' : '');
+       select.textContent = session.label + (session.loading ? ' (...)' : session.testCount !== undefined ? ' (' + session.testCount + ')' : '');
        select.title = tab.title;
        select.addEventListener('click', () => vscode.postMessage({ type: 'selectSession', key: session.key }));
        const close = document.createElement('button');

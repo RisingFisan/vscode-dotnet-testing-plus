@@ -57,7 +57,11 @@ export function buildSolutionTree(
       continue;
     }
     const projectPath = options?.projects?.get(entry.fullyQualifiedName);
-    const label = projectLabelOf(entry);
+    // Playlist Project metadata can be a common product name rather than the
+    // actual test project. The source scan identifies the owning .csproj.
+    const label = projectPath
+      ? path.basename(projectPath, path.extname(projectPath))
+      : projectLabelOf(entry);
     const projectId = `${root.id}:project:${keyPart(projectPath ?? label)}`;
     let projectItem = projectItems.get(projectId);
     if (!projectItem) {
@@ -69,11 +73,12 @@ export function buildSolutionTree(
     const fqn = entry.fullyQualifiedName;
     const lastDot = fqn.lastIndexOf('.');
     const className = lastDot === -1 ? fqn : fqn.slice(0, lastDot);
+    const classLabel = className.startsWith(`${label}.`) ? className.slice(label.length + 1) : className;
     const testName = lastDot === -1 ? fqn : fqn.slice(lastDot + 1);
     const classId = `${projectItem.id}:class:${keyPart(className)}`;
     let classItem = projectItem.children.get(classId);
     if (!classItem) {
-      classItem = controller.createTestItem(classId, className);
+      classItem = controller.createTestItem(classId, classLabel);
       projectItem.children.add(classItem);
     }
     const loc = options?.locations?.get(fqn);
