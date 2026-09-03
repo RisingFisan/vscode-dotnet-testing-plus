@@ -12,7 +12,7 @@ VS Code extension ".NET Testing+": loads a Visual Studio `.playlist`, runs those
 
 ## Version bumping
 
-Every change that requires recompiling the project must bump the version (in `package.json` **and** the hardcoded version in the activation `log(...)` string in `src/extension.ts` — they have drifted before), unless told otherwise.
+Every change that requires recompiling the project should bump the version (in `package.json` **and** the hardcoded version in the activation `log(...)` string in `src/extension.ts` — they have drifted before). Before proceeding, confirm with the user. Never bump the version without explicit approval.
 
 - New feature → bump the minor (X.Y+1.Z).
 - Bug fix or minor change → bump the patch (X.Y.Z+1).
@@ -23,6 +23,7 @@ Every change that requires recompiling the project must bump the version (in `pa
 1. Bump `version` per the version-bumping rules above (both locations).
 2. `npm run compile && npm run lint`
 3. Package, install, delete older `*.vsix` files.
+4. If asked to publish, use the `VSCE_PAT` env var specified in `.env`, when such file exists. Never publish without explicit approval.
 
 ## Architecture
 

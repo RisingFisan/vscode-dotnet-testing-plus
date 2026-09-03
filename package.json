@@ -2,7 +2,7 @@
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
   "description": "Filter, run, and debug tests from .NET solutions using Visual Studio playlists, advanced filters, and runsettings.",
-  "version": "1.13.3",
+  "version": "1.14.1",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "GPL-3.0-only",
@@ -40,19 +40,6 @@
       }
     },
     "commands": [
-      {
-        "command": "dotnet-testing-plus.selectSolution",
-        "title": "Add Solution",
-        "category": ".NET Testing+",
-        "icon": "$(file-directory)"
-      },
-      {
-        "command": "dotnet-testing-plus.switchSolution",
-        "title": "Add Solution",
-        "category": ".NET Testing+",
-        "icon": "$(arrow-swap)",
-        "enablement": "!dotnetTestingPlus.solutionLoading"
-      },
       {
         "command": "dotnet-testing-plus.addSolution",
         "title": "Add Solution...",
@@ -119,24 +106,6 @@
         "category": ".NET Testing+",
         "icon": "$(debug-alt)",
         "enablement": "dotnetTestingPlus.solutionReady"
-      },
-      {
-        "command": "dotnet-testing-plus.runTest",
-        "title": "Run Test",
-        "category": ".NET Testing+",
-        "icon": "$(run)"
-      },
-      {
-        "command": "dotnet-testing-plus.debugTest",
-        "title": "Debug Test",
-        "category": ".NET Testing+",
-        "icon": "$(debug-alt)"
-      },
-      {
-        "command": "dotnet-testing-plus.goToTest",
-        "title": "Go to Test",
-        "category": ".NET Testing+",
-        "icon": "$(go-to-file)"
       }
     ],
     "views": {

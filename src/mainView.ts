@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { CustomRunsettingsViewState } from './runsettingsManager';
+import { TestResultFilter, TestResultFilterKey, createDefaultTestResultFilter } from './testResultFilter';
 
 export type RunsettingsMode = 'default' | 'override' | 'custom';
 
@@ -24,6 +25,7 @@ export interface MainViewState {
   defaultRunsettingsAvailable: boolean;
   hasExplicitRunsettings: boolean;
   filter: string;
+  resultFilter: TestResultFilter;
   skipPreBreakpoint: boolean;
   notFoundTests: string[];
   customRunsettings?: CustomRunsettingsViewState;
@@ -35,6 +37,8 @@ export type MainViewAction =
   | { type: 'selectSession'; key: string }
   | { type: 'setRunsettingsMode'; mode: RunsettingsMode }
   | { type: 'filter'; text: string }
+  | { type: 'clearFilter' }
+  | { type: 'setResultFilter'; key: TestResultFilterKey; checked: boolean }
   | { type: 'toggleSkipPreBreakpoint'; checked: boolean }
   | { type: 'setCustomRunsettingsValue'; key: string; value: string }
   | { type: 'resetCustomRunsettingsValue'; key: string }
@@ -52,6 +56,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     defaultRunsettingsAvailable: false,
     hasExplicitRunsettings: false,
     filter: '',
+    resultFilter: createDefaultTestResultFilter(),
     skipPreBreakpoint: true,
     notFoundTests: [],
     customRunsettings: undefined
@@ -72,6 +77,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       id?: string;
       field?: 'name' | 'value';
       mode?: RunsettingsMode;
+      resultFilterKey?: TestResultFilterKey;
     }) => {
       if (msg.type === 'ready') {
         this.postState();
@@ -81,6 +87,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
         this.onAction({ type: 'removeSolution', key: msg.key });
       } else if (msg.type === 'filter') {
         this.onAction({ type: 'filter', text: msg.text ?? '' });
+      } else if (msg.type === 'setResultFilter' && msg.resultFilterKey !== undefined) {
+        this.onAction({ type: 'setResultFilter', key: msg.resultFilterKey, checked: msg.checked ?? true });
       } else if (msg.type === 'setRunsettingsMode' && msg.mode !== undefined) {
         this.onAction({ type: 'setRunsettingsMode', mode: msg.mode });
       } else if (msg.type === 'toggleSkipPreBreakpoint') {
@@ -134,6 +142,7 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       defaultRunsettingsAvailable: s.defaultRunsettingsAvailable,
       hasExplicitRunsettings: s.hasExplicitRunsettings,
       filter: s.filter,
+      resultFilter: s.resultFilter,
       skipPreBreakpoint: s.skipPreBreakpoint,
       notFoundTests: s.notFoundTests,
       customRunsettings: s.customRunsettings
@@ -158,15 +167,36 @@ function renderHtml(): string {
     color: var(--vscode-foreground);
   }
   .filter-row { display: flex; gap: 4px; align-items: center; }
-  .tabs-wrapper { display: flex; flex-direction: column; border: 2px solid var(--vscode-panel-border); border-radius: 8px;}
-   .solution-tabs { display: flex; gap: 4px; align-items: center; overflow-x: auto; border-bottom: 2px solid var(--vscode-panel-border); padding: 0 4px; }
-  #solutionTabs { display: flex; gap: 4px; flex: 0 0 auto; align-items: center; height: 32px; }
-  .solution-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 180px; height: 100%; }
-  .solution-tab.active { background: var(--vscode-tab-activeBackground); color: var(--vscode-tab-activeForeground); font-weight: bold; }
-  .solution-tab-select { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: transparent; color: inherit; padding: 5px 8px; }
-  .solution-tab-close { background: transparent; color: inherit; padding: 3px 5px; font-size: 1.1em; line-height: 1; }
-  .solution-tab-close:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
-  #addSolution { display: flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; font-size: 1.2em; line-height: 1; }
+  input[type="text"] { border-radius: 4px; }
+  .result-filter { position: relative; }
+  .result-filter-menu {
+    position: absolute;
+    z-index: 1;
+    top: calc(100% + 2px);
+    right: 0;
+    min-width: 180px;
+    padding: 6px;
+    background: var(--vscode-menu-background);
+    color: var(--vscode-menu-foreground);
+    border: 1px solid var(--vscode-input-border, var(--vscode-editorWidget-border));
+    border-radius: 4px;
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow);
+    overflow: hidden;
+  }
+  .result-filter-option { display: flex; align-items: center; gap: 6px; padding: 3px; cursor: pointer; white-space: nowrap; }
+  .result-filter-option:hover { background: var(--vscode-menu-selectionBackground); color: var(--vscode-menu-selectionForeground); }
+  .icon-button { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 3px; }
+  .icon-button svg { width: 16px; height: 16px; fill: currentColor; }
+  .tabs-wrapper { display: flex; flex-direction: column; border: 1px solid var(--vscode-surface-border, var(--vscode-widget-border)); border-radius: 8px; background: var(--vscode-panel-background); }
+   .solution-tabs { display: flex; gap: 4px; align-items: center; overflow-x: auto; padding: 4px; margin-bottom: 6px; }
+  #solutionTabs { display: flex; gap: 4px; flex: 0 0 auto; align-items: center; height: 24px; }
+  .solution-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 180px; height: 100%; color: var(--vscode-tab-inactiveForeground); }
+  .solution-tab:hover { background: var(--vscode-modernTab-hoverBackground, var(--vscode-button-secondaryHoverBackground)); }
+  .solution-tab.active { background: var(--vscode-modernTab-activeBackground, var(--vscode-button-secondaryHoverBackground)); color: var(--vscode-tab-activeForeground); font-weight: bold; border-radius: 4px; }
+  .solution-tab-select { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: transparent; color: inherit; }
+  .solution-tab-close { background: transparent; color: inherit; padding: 3px; width: 18px; height: 100%; }
+  .solution-tab-close:hover:not(:disabled) { background: var(--vscode-modernEditorTab-activeHoverBackground); }
+  #addSolution { display: flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; line-height: 1; }
   input#filter {
     flex: 1;
     min-width: 0;
@@ -183,18 +213,24 @@ function renderHtml(): string {
     background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground);
     border: none;
+    border-radius: 4px;
     padding: 3px 8px;
     cursor: pointer;
     font-family: inherit;
     font-size: inherit;
     white-space: nowrap;
   }
+  button.solid {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
   button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+  button.solid:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
   button:disabled { opacity: 0.5; cursor: default; }
   select#runsettingsMode {
     background: var(--vscode-dropdown-background);
     color: var(--vscode-dropdown-foreground);
-    border: 1px solid var(--vscode-dropdown-border, transparent);
+    border: 0;
     font-family: inherit;
     font-size: inherit;
     padding: 2px 4px;
@@ -202,7 +238,7 @@ function renderHtml(): string {
   select#runsettingsMode:disabled { opacity: 0.5; }
   #selectRunsettings { align-self: flex-start; }
   #customRunsettingsSection { padding: 4px; }
-  .section { padding: 4px 8px; }
+  .section { padding: 2px 8px; }
   .row { display: flex; flex-direction: row; gap: 6px; align-items: center; min-height: 32px; }
   .section .label { font-weight: 600; }
   .section .name {
@@ -214,6 +250,7 @@ function renderHtml(): string {
   }
   .section .name.empty { opacity: 0.6; font-style: italic; }
   .toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .skip-pre-breakpoint { display: inline-flex; flex-direction: row; align-items: center; }
   .toggle input { margin: 0; }
   .runsettings-zone { display: flex; flex-direction: column; gap: 4px; }
   details { padding: 0; }
@@ -243,28 +280,37 @@ function renderHtml(): string {
     <span class="label">Advanced Search</span>
   </div>
   <div class="filter-row">
-    <input id="filter" type="text"
-      placeholder="Filter: class:Checkout & (project:Web|class:Cart)"
-      title="Spaces are ignored. '&' ANDs terms, '|' ORs them, parentheses group. class:/project: qualify a term or group; unqualified terms match the test name."/>
-    <button id="clearFilter" title="Clear filter">Clear</button>
-  </div>
+     <input id="filter" type="text"
+       placeholder="Filter: class:Checkout & (project:Web|class:Cart)"
+       title="Spaces are ignored. '&' ANDs terms, '|' ORs them, parentheses group. class:/project: qualify a term or group; unqualified terms match the test name."/>
+      <button class="icon-button" id="clearFilter" title="Clear" aria-label="Clear"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m8 7.293 4.646-4.647.708.708L8.707 8l4.647 4.646-.708.708L8 8.707l-4.646 4.647-.708-.708L7.293 8 2.646 3.354l.708-.708z"/></svg></button>
+      <div class="result-filter">
+        <button class="icon-button" id="resultFilterButton" title="Filter" aria-label="Filter" aria-expanded="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2h12v2.5L9 9v4.5l-2 1V9L2 4.5z"/></svg></button>
+       <div class="result-filter-menu" id="resultFilterMenu" hidden>
+         <label class="result-filter-option"><input id="resultFilter-passing" type="checkbox" data-result-filter-key="passing"/>Show passing tests</label>
+         <label class="result-filter-option"><input id="resultFilter-failing" type="checkbox" data-result-filter-key="failing"/>Show failing tests</label>
+         <label class="result-filter-option"><input id="resultFilter-notRun" type="checkbox" data-result-filter-key="notRun"/>Show not run tests</label>
+         <label class="result-filter-option"><input id="resultFilter-skipped" type="checkbox" data-result-filter-key="skipped"/>Show skipped tests</label>
+       </div>
+     </div>
+   </div>
   <div class="section">
     <button id="saveAsPlaylist" title="Export the tests currently visible in the Test Explorer to a .playlist file" disabled>Save As Playlist</button>
   </div>
-  <div class="divider" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+  <div class="divider" style="border-top: 1px solid var(--vscode-surface-border);"></div>
   <div class="section">
     <span class="label">Solution Manager</span>
   </div>
   <div class="tabs-wrapper">
     <div class="solution-tabs">
       <div id="solutionTabs" aria-label="Loaded solutions"></div>
-      <button id="addSolution" title="Add Solution..." aria-label="Add solution">+</button>
+      <button class="icon-button" id="addSolution" title="Add Solution..." aria-label="Add solution"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path d="M8 2.5v11M2.5 8h11"/></svg></button>
     </div>
     <div class="section row">
       <span class="label">Playlist</span>
       <span class="name empty" id="playlistName">No playlist selected</span>
-      <button id="selectPlaylist" title="Select Playlist File...">Select</button>
-      <button id="clearPlaylist" title="Clear Playlist">Clear</button>
+      <button class="solid" id="selectPlaylist" title="Select Playlist File...">Select</button>
+      <button class="solid" id="clearPlaylist" title="Clear Playlist">Clear</button>
     </div>
     <div class="section runsettings-zone">
       <div class="runsettings-section row">
@@ -276,7 +322,7 @@ function renderHtml(): string {
         </select>
         <span class="name empty" id="runsettingsName">None</span>
       </div>
-      <button id="selectRunsettings" title="Select Runsettings File..." hidden>Select Runsettings File...</button>
+      <button class="solid" id="selectRunsettings" title="Select Runsettings File..." hidden>Select Runsettings File...</button>
       <details id="customRunsettingsSection" hidden>
         <summary>Custom runsettings</summary>
         <div class="custom-content">
@@ -288,9 +334,9 @@ function renderHtml(): string {
       </details>
     </div>
     <div class="section row">
-      <label class="toggle" title="When debugging, automatically continue past the test host's initial Debugger.Break() so the run starts without a manual Continue.">
+      <label class="toggle skip-pre-breakpoint" title="When debugging, automatically continue past the test host's initial Debugger.Break() so the run starts without a manual Continue.">
+        <span class="label">Skip pre-breakpoint:</span>
         <input type="checkbox" id="skipPreBreakpoint"/>
-        <span class="label">Skip pre-breakpoint</span>
       </label>
     </div>
     <div class="section not-found" id="notFoundSection" hidden>
@@ -302,6 +348,16 @@ function renderHtml(): string {
   const vscode = acquireVsCodeApi();
   const $ = id => document.getElementById(id);
   const input = $('filter');
+
+  function createIcon(pathData) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', pathData);
+    svg.appendChild(path);
+    return svg;
+  }
 
   function renderSessions(sessions, activeKey) {
     const tabs = $('solutionTabs');
@@ -315,9 +371,9 @@ function renderHtml(): string {
        select.textContent = session.label + (session.loading ? ' (...)' : session.testCount !== undefined ? ' (' + session.testCount + ')' : '');
        select.title = tab.title;
        select.addEventListener('click', () => vscode.postMessage({ type: 'selectSession', key: session.key }));
-       const close = document.createElement('button');
-       close.className = 'solution-tab-close';
-       close.textContent = 'x';
+        const close = document.createElement('button');
+        close.className = 'solution-tab-close icon-button';
+        close.appendChild(createIcon('m8 7.293 4.646-4.647.708.708L8.707 8l4.647 4.646-.708.708L8 8.707l-4.646 4.647-.708-.708L7.293 8 2.646 3.354l.708-.708z'));
        close.title = 'Unload ' + session.label;
        close.setAttribute('aria-label', 'Unload ' + session.label);
        close.addEventListener('click', event => {
@@ -342,7 +398,32 @@ function renderHtml(): string {
   $('clearFilter').addEventListener('click', () => {
     input.value = '';
     updateSaveAsPlaylist();
-    vscode.postMessage({ type: 'filter', text: '' });
+    vscode.postMessage({ type: 'clearFilter' });
+  });
+  const resultFilterButton = $('resultFilterButton');
+  const resultFilterMenu = $('resultFilterMenu');
+  function closeResultFilterMenu() {
+    resultFilterMenu.hidden = true;
+    resultFilterButton.setAttribute('aria-expanded', 'false');
+  }
+  resultFilterButton.addEventListener('click', event => {
+    event.stopPropagation();
+    resultFilterMenu.hidden = !resultFilterMenu.hidden;
+    resultFilterButton.setAttribute('aria-expanded', String(!resultFilterMenu.hidden));
+  });
+  resultFilterMenu.addEventListener('click', event => event.stopPropagation());
+  resultFilterMenu.querySelectorAll('input[data-result-filter-key]').forEach(checkbox => {
+    checkbox.addEventListener('change', () => vscode.postMessage({
+      type: 'setResultFilter',
+      resultFilterKey: checkbox.dataset.resultFilterKey,
+      checked: checkbox.checked
+    }));
+  });
+  document.addEventListener('click', closeResultFilterMenu);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      closeResultFilterMenu();
+    }
   });
    $('saveAsPlaylist').addEventListener('click', () => vscode.postMessage({ type: 'saveAsPlaylist' }));
    $('addSolution').addEventListener('click', () => vscode.postMessage({ type: 'addSolution' }));
@@ -356,9 +437,33 @@ function renderHtml(): string {
     vscode.postMessage({ type: 'toggleSkipPreBreakpoint', checked: e.target.checked }));
 
   const customDebounces = {};
+  const pendingCustomValues = Object.create(null);
+  let latestCustomRunsettings;
+  let latestRunsettingsMode = 'custom';
+  let deferredCustomRender = false;
   function postCustomChange(message, debounceKey) {
     clearTimeout(customDebounces[debounceKey]);
     customDebounces[debounceKey] = setTimeout(() => vscode.postMessage(message), 250);
+  }
+
+  function isEditingCustomRunsettings() {
+    const active = document.activeElement;
+    return !!(active && active.dataset && active.dataset.customKey);
+  }
+
+  function reconcilePendingCustomValues(custom) {
+    const applied = Object.create(null);
+    (custom?.parameters || []).forEach(item => { applied[item.key] = item.value; });
+    (custom?.values || []).forEach(item => { applied[item.key] = item.value; });
+    (custom?.customParameters || []).forEach(item => {
+      applied[item.id + ':name'] = item.name;
+      applied[item.id + ':value'] = item.value;
+    });
+    Object.keys(pendingCustomValues).forEach(key => {
+      if (Object.prototype.hasOwnProperty.call(applied, key) && applied[key] === pendingCustomValues[key]) {
+        delete pendingCustomValues[key];
+      }
+    });
   }
 
   function setName(el, name, emptyText, tooltip) {
@@ -389,11 +494,20 @@ function renderHtml(): string {
   function createCustomInput(value, key, onInput, readOnly) {
     const input = document.createElement('input');
     input.type = 'text';
-    input.value = value ?? '';
+    input.value = Object.prototype.hasOwnProperty.call(pendingCustomValues, key) ? pendingCustomValues[key] : (value ?? '');
     input.dataset.customKey = key;
     input.readOnly = !!readOnly;
     if (!readOnly) {
-      input.addEventListener('input', () => onInput(input.value));
+      input.addEventListener('input', () => {
+        pendingCustomValues[key] = input.value;
+        onInput(input.value);
+      });
+      input.addEventListener('blur', () => setTimeout(() => {
+        if (deferredCustomRender && !isEditingCustomRunsettings()) {
+          deferredCustomRender = false;
+          renderCustomRunsettings(latestCustomRunsettings, latestRunsettingsMode);
+        }
+      }, 0));
     }
     return input;
   }
@@ -403,7 +517,10 @@ function renderHtml(): string {
     button.textContent = 'Reset';
     button.disabled = !overridden;
     button.title = 'Use the value from the base runsettings file';
-    button.addEventListener('click', () => vscode.postMessage({ type: 'resetCustomRunsettingsValue', key }));
+    button.addEventListener('click', () => {
+      delete pendingCustomValues[key];
+      vscode.postMessage({ type: 'resetCustomRunsettingsValue', key });
+    });
     return button;
   }
 
@@ -435,7 +552,11 @@ function renderHtml(): string {
     const remove = document.createElement('button');
     remove.textContent = 'Remove';
     remove.title = 'Remove custom parameter';
-    remove.addEventListener('click', () => vscode.postMessage({ type: 'removeCustomRunsettingsParameter', id: item.id }));
+    remove.addEventListener('click', () => {
+      delete pendingCustomValues[item.id + ':name'];
+      delete pendingCustomValues[item.id + ':value'];
+      vscode.postMessage({ type: 'removeCustomRunsettingsParameter', id: item.id });
+    });
     row.appendChild(remove);
     return row;
   }
@@ -454,6 +575,16 @@ function renderHtml(): string {
   }
 
   function renderCustomRunsettings(custom, mode) {
+    latestCustomRunsettings = custom;
+    latestRunsettingsMode = mode;
+    reconcilePendingCustomValues(custom);
+    // Extension state is persisted asynchronously. Do not replace this editor
+    // with an older state echo while a user is typing in one of its fields.
+    if (isEditingCustomRunsettings()) {
+      deferredCustomRender = true;
+      return;
+    }
+    deferredCustomRender = false;
     const section = $('customRunsettingsSection');
     // The override editor only exists in Override mode: Default uses the file
     // as-is and Custom files can never be overridden.
@@ -466,11 +597,6 @@ function renderHtml(): string {
     const groups = $('customRunsettingsGroups');
     const warnings = $('customRunsettingsWarnings');
     const add = $('addCustomParameter');
-    const active = document.activeElement;
-    const activeKey = active && active.dataset ? active.dataset.customKey : undefined;
-    const activeSelection = active && typeof active.selectionStart === 'number'
-      ? [active.selectionStart, active.selectionEnd]
-      : undefined;
     groups.replaceChildren();
     if (!custom || !custom.available) {
       section.open = false;
@@ -500,16 +626,6 @@ function renderHtml(): string {
       line.textContent = message;
       warnings.appendChild(line);
     });
-    if (activeKey) {
-      const next = document.querySelector('[data-custom-key="' + CSS.escape(activeKey) + '"]');
-      if (next) {
-        next.focus();
-        if (activeSelection) {
-          next.selectionStart = activeSelection[0];
-          next.selectionEnd = activeSelection[1];
-        }
-      }
-    }
   }
 
   window.addEventListener('message', event => {
@@ -521,6 +637,9 @@ function renderHtml(): string {
     if (document.activeElement !== input && input.value !== (s.filter ?? '')) {
       input.value = s.filter ?? '';
     }
+    ['passing', 'failing', 'notRun', 'skipped'].forEach(key => {
+      $('resultFilter-' + key).checked = s.resultFilter?.[key] !== false;
+    });
     updateSaveAsPlaylist();
     setName($('playlistName'), s.playlistName, 'No playlist selected', s.playlistFull);
     setName($('runsettingsName'), s.runsettingsName, 'None', s.runsettingsFull);

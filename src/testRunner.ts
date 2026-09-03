@@ -7,6 +7,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { XMLParser } from 'fast-xml-parser';
 import { log, logCommand } from './logger';
 import { SourceLocation } from './sourceScan';
+import { TestResultState } from './testResultFilter';
 
 const CHUNK_SIZE = 100;
 
@@ -42,6 +43,7 @@ interface RunOptions {
   descriptors?: Map<string, TestDescriptor>;
   /** Auto-continue past the test host's initial Debugger.Break() when debugging. */
   skipPreBreakpoint?: boolean;
+  onTestStateChange?: (test: vscode.TestItem, state: TestResultState) => void;
 }
 
 function asArray<T>(value: T | T[] | undefined): T[] {
@@ -53,6 +55,15 @@ function asArray<T>(value: T | T[] | undefined): T[] {
 
 function appendOutput(run: vscode.TestRun, text: string): void {
   run.appendOutput(text.replace(/\r?\n/g, '\r\n'));
+}
+
+function setTestState(options: RunOptions | undefined, test: vscode.TestItem, state: TestResultState): void {
+  options?.onTestStateChange?.(test, state);
+}
+
+function skipTest(run: vscode.TestRun, test: vscode.TestItem, options?: RunOptions): void {
+  setTestState(options, test, 'skipped');
+  run.skipped(test);
 }
 
 /**
@@ -104,12 +115,12 @@ export async function runPlaylistTests(
     const tests = collectTestsToRun(controller, request);
 
     const { groups: bySolution, unassigned } = groupTestsBySolution(tests, solutions, options);
-    unassigned.forEach(test => run.skipped(test));
+    unassigned.forEach(test => skipTest(run, test, options));
     // Map insertion order follows the requested tree order, so all work for a
     // solution completes before the next solution is built or run.
     for (const [solutionPath, solutionTests] of bySolution) {
       if (cancel.token.isCancellationRequested) {
-        solutionTests.forEach(test => run.skipped(test));
+        solutionTests.forEach(test => skipTest(run, test, options));
         continue;
       }
       const solution = solutions.get(solutionPath)!;
@@ -188,7 +199,7 @@ async function runSolutionTests(
     const message = `Skipping ${unmapped.length} test(s) with no owning project mapping.`;
     log(message);
     appendOutput(run, message + '\n');
-    unmapped.forEach(test => run.skipped(test));
+    unmapped.forEach(test => skipTest(run, test, options));
   }
   if (groups.size === 0) {
     return;
@@ -197,12 +208,12 @@ async function runSolutionTests(
   await buildSolutionOnce(solution.solutionPath, run, token);
   for (const [csproj, projectTests] of groups) {
     if (token.isCancellationRequested) {
-      projectTests.forEach(test => run.skipped(test));
+      projectTests.forEach(test => skipTest(run, test, solutionOptions));
       continue;
     }
     for (let i = 0; i < projectTests.length; i += chunkSize) {
       if (token.isCancellationRequested) {
-        projectTests.slice(i).forEach(test => run.skipped(test));
+        projectTests.slice(i).forEach(test => skipTest(run, test, solutionOptions));
         break;
       }
       await runChunk(csproj, projectTests.slice(i, i + chunkSize), run, token, debug, solutionOptions, true);
@@ -271,9 +282,11 @@ function reportOutcome(
   ctx.reported.add(test.id);
   switch (outcome) {
     case 'Passed':
+      setTestState(ctx.options, test, 'passed');
       ctx.run.passed(test, durationMs);
       break;
     case 'Failed': {
+      setTestState(ctx.options, test, 'failed');
       const message = new vscode.TestMessage(failure?.message ?? 'Test failed');
       const frames = failure?.stackTrace ? parseStackTrace(failure.stackTrace) : [];
       if (frames.length > 0) {
@@ -300,7 +313,7 @@ function reportOutcome(
       break;
     }
     default:
-      ctx.run.skipped(test);
+      skipTest(ctx.run, test, ctx.options);
       break;
   }
 }
@@ -501,6 +514,7 @@ async function runChunk(
   noBuild = false
 ): Promise<void> {
   tests.forEach(t => {
+    setTestState(options, t, 'queued');
     run.enqueued(t);
   });
 
@@ -528,6 +542,7 @@ async function runChunk(
   const stopTailer = streamLogPath ? startStreamTailer(streamLogPath, ctx) : undefined;
 
   tests.forEach(t => {
+    setTestState(options, t, 'running');
     run.started(t);
   });
 
@@ -553,7 +568,7 @@ async function runChunk(
     }
     for (const test of ctx.tests) {
       if (!ctx.reported.has(test.id)) {
-        run.skipped(test);
+        skipTest(run, test, options);
       }
     }
   } catch (err) {
@@ -563,8 +578,9 @@ async function runChunk(
         continue;
       }
       if (token.isCancellationRequested) {
-        run.skipped(test);
+        skipTest(run, test, options);
       } else {
+        setTestState(options, test, 'failed');
         run.errored(test, new vscode.TestMessage(message));
       }
     }

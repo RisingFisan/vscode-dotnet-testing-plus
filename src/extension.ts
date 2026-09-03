@@ -13,6 +13,7 @@ import { buildSolutionPlaceholder, buildSolutionTree, testItemId } from './testT
 import { initLogger, showLog, log } from './logger';
 import { MainViewProvider, MainViewAction, RunsettingsMode } from './mainView';
 import { TestFilter, parseTestFilter, filterEntries } from './testFilter';
+import { TestResultFilter, TestResultFilterKey, TestResultState, createDefaultTestResultFilter, isTestResultVisible } from './testResultFilter';
 import {
   findDefaultRunsettings,
   hasCustomRunsettings,
@@ -54,6 +55,8 @@ interface SolutionSession {
   runsettingsMode: RunsettingsMode;
   customRunsettings: CustomRunsettingsState;
   activeFilter?: TestFilter;
+  testResultFilter: TestResultFilter;
+  testResultStates: Map<string, TestResultState>;
   discoveryCts?: vscode.CancellationTokenSource;
   testLocations: Map<string, SourceLocation>;
   testProjects: Map<string, string>;
@@ -77,7 +80,7 @@ let activeSessionKey: string | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.13.3, multi-solution discovery)');
+  log('Extension activated (v1.14.1, multi-solution discovery)');
   extensionContext = context;
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -91,28 +94,50 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     controller.createRunProfile('Run', vscode.TestRunProfileKind.Run, (request, token) => runWithSolutions(request, token, false), true),
     controller.createRunProfile('Debug', vscode.TestRunProfileKind.Debug, (request, token) => runWithSolutions(request, token, true), true),
-    vscode.commands.registerCommand('dotnet-testing-plus.selectSolution', () => addSolution(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.switchSolution', () => addSolution(context)),
     vscode.commands.registerCommand('dotnet-testing-plus.addSolution', () => addSolution(context)),
-     vscode.commands.registerCommand('dotnet-testing-plus.removeSolution', () => removeSolution(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.stopLoading', () => activeSession()?.discoveryCts?.cancel()),
-    vscode.commands.registerCommand('dotnet-testing-plus.selectRunsettings', () => selectRunsettings(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.clearRunsettings', () => clearRunsettings(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.selectPlaylist', () => selectPlaylist(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.clearPlaylist', () => clearPlaylist(context)),
-    vscode.commands.registerCommand('dotnet-testing-plus.refresh', () => refreshActive()),
+    vscode.commands.registerCommand('dotnet-testing-plus.removeSolution', async () => {
+      const session = await pickLoadedSession('Select a solution to unload');
+      if (session) {
+        await removeSolution(context, session.key);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.stopLoading', async () => {
+      const session = await pickLoadedSession('Select a solution to stop loading', item => item.discoveryCts !== undefined);
+      session?.discoveryCts?.cancel();
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.selectRunsettings', async () => {
+      const session = await pickLoadedSession('Select a solution for runsettings');
+      if (session) {
+        await selectRunsettings(context, session);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.clearRunsettings', async () => {
+      const session = await pickLoadedSession('Select a solution to clear runsettings');
+      if (session) {
+        await clearRunsettings(context, session);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.selectPlaylist', async () => {
+      const session = await pickLoadedSession('Select a solution for a playlist');
+      if (session) {
+        await selectPlaylist(context, session);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.clearPlaylist', async () => {
+      const session = await pickLoadedSession('Select a solution to clear its playlist');
+      if (session) {
+        await clearPlaylist(context, session);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.refresh', async () => {
+      const session = await pickLoadedSession('Select a solution to refresh');
+      if (session) {
+        await refreshSolution(session);
+      }
+    }),
     vscode.commands.registerCommand('dotnet-testing-plus.showOutput', () => showLog()),
     vscode.commands.registerCommand('dotnet-testing-plus.runAll', () => runAllTests(false)),
     vscode.commands.registerCommand('dotnet-testing-plus.debugAll', () => runAllTests(true)),
-    vscode.commands.registerCommand('dotnet-testing-plus.runTest', (arg) => runSingleTest(arg, false)),
-    vscode.commands.registerCommand('dotnet-testing-plus.debugTest', (arg) => runSingleTest(arg, true)),
-    vscode.commands.registerCommand('dotnet-testing-plus.goToTest', (location: SourceLocation | undefined) => {
-      if (location) {
-        void vscode.window.showTextDocument(vscode.Uri.file(location.file), {
-          selection: new vscode.Range(location.line - 1, 0, location.line - 1, 0)
-        });
-      }
-    }),
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('dotnetTestingPlus.skipPreBreakpoint')) {
         void updateContexts();
@@ -156,6 +181,8 @@ function createSession(saved: PersistedSession): SolutionSession {
     runsettingsPath,
     runsettingsMode,
     customRunsettings,
+    testResultFilter: createDefaultTestResultFilter(),
+    testResultStates: new Map(),
     testLocations: new Map(),
     testProjects: new Map(),
     notFoundTests: [],
@@ -165,6 +192,26 @@ function createSession(saved: PersistedSession): SolutionSession {
 
 function activeSession(): SolutionSession | undefined {
   return activeSessionKey ? sessions.get(activeSessionKey) : undefined;
+}
+
+async function pickLoadedSession(
+  placeHolder: string,
+  predicate: (session: SolutionSession) => boolean = () => true
+): Promise<SolutionSession | undefined> {
+  const candidates = [...sessions.values()].filter(predicate);
+  if (candidates.length === 0) {
+    vscode.window.showInformationMessage('No matching loaded solution is available.');
+    return undefined;
+  }
+  const picked = await vscode.window.showQuickPick(
+    candidates.map(session => ({
+      label: path.basename(session.solutionPath, path.extname(session.solutionPath)),
+      detail: session.solutionPath,
+      session
+    })),
+    { placeHolder }
+  );
+  return picked?.session;
 }
 
 function disposeSession(session: SolutionSession): void {
@@ -383,7 +430,9 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
     session.notFoundTests = entries
       .filter(entry => !session.knownTests!.has(entry.fullyQualifiedName))
       .map(entry => entry.fullyQualifiedName);
-    return entries.filter(entry => session.knownTests!.has(entry.fullyQualifiedName));
+    return entries
+      .filter(entry => session.knownTests!.has(entry.fullyQualifiedName))
+      .filter(entry => isTestResultVisible(session.testResultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
   }
   session.notFoundTests = [];
   const entries: PlaylistTest[] = [];
@@ -400,7 +449,8 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
       fullyQualifiedName: fqn
     });
   }
-  return filterEntries(entries, session.activeFilter);
+  return filterEntries(entries, session.activeFilter)
+    .filter(entry => isTestResultVisible(session.testResultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
 }
 
 function renderTree(): void {
@@ -473,11 +523,36 @@ async function runWithSolutions(request: vscode.TestRunRequest, token: vscode.Ca
       });
     }
   }
+  let renderPending = false;
+  const scheduleRender = (): void => {
+    if (renderPending) {
+      return;
+    }
+    renderPending = true;
+    setTimeout(() => {
+      renderPending = false;
+      renderTree();
+      void updateContexts();
+    }, 0);
+  };
   await runPlaylistTests(controller, request, token, debug, solutionOptions, {
     descriptors,
     loggerDir: extensionPath ? path.join(extensionPath, 'assets', 'logger') : undefined,
     chunkSize: vscode.workspace.getConfiguration('dotnetTestingPlus').get<number>('chunkSize', 100),
-    skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true)
+    skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
+    onTestStateChange: (test, state) => {
+      const descriptor = descriptors.get(test.id);
+      const session = descriptor && sessions.get(descriptor.solutionPath);
+      if (!descriptor || !session) {
+        return;
+      }
+      const previous = session.testResultStates.get(descriptor.fullyQualifiedName) ?? 'notRun';
+      session.testResultStates.set(descriptor.fullyQualifiedName, state);
+      if (isTestResultVisible(session.testResultFilter, previous) !== isTestResultVisible(session.testResultFilter, state)) {
+        session.treeDirty = true;
+        scheduleRender();
+      }
+    }
   });
 }
 
@@ -535,45 +610,6 @@ async function runAllTests(debug: boolean): Promise<void> {
   }
 }
 
-async function runSingleTest(arg: unknown, debug: boolean): Promise<void> {
-  const value = typeof arg === 'string' ? arg : (arg as { fqn?: string; id?: string } | undefined);
-  const session = activeSession();
-  if (!session) {
-    return;
-  }
-  const id = typeof value === 'string' ? testItemId(session.solutionPath, value) : value?.id ?? (value?.fqn && testItemId(session.solutionPath, value.fqn));
-  if (!id) {
-    return;
-  }
-  const item = findTestItem(id);
-  if (!item) {
-    vscode.window.showWarningMessage('Test not found in the active solution tree.');
-    return;
-  }
-  const cts = new vscode.CancellationTokenSource();
-  try {
-    await runWithSolutions(new vscode.TestRunRequest([item]), cts.token, debug);
-  } finally {
-    cts.dispose();
-  }
-}
-
-function findTestItem(id: string): vscode.TestItem | undefined {
-  let found: vscode.TestItem | undefined;
-  const walk = (item: vscode.TestItem): void => {
-    if (found) {
-      return;
-    }
-    if (item.id === id) {
-      found = item;
-      return;
-    }
-    item.children.forEach(walk);
-  };
-  controller.items.forEach(walk);
-  return found;
-}
-
 async function handleViewAction(context: vscode.ExtensionContext, action: MainViewAction): Promise<void> {
   switch (action.type) {
     case 'addSolution': await addSolution(context); break;
@@ -586,6 +622,8 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
     case 'clearRunsettings': await clearRunsettings(context); break;
     case 'setRunsettingsMode': await setRunsettingsMode(context, action.mode); break;
     case 'filter': applyFilterInput(action.text); break;
+    case 'clearFilter': clearSearchFilters(); break;
+    case 'setResultFilter': applyResultFilter(action.key, action.checked); break;
     case 'toggleSkipPreBreakpoint':
       await vscode.workspace.getConfiguration('dotnetTestingPlus').update('skipPreBreakpoint', action.checked, vscode.ConfigurationTarget.Global);
       break;
@@ -608,8 +646,30 @@ function applyFilterInput(text: string): void {
   void updateContexts();
 }
 
-async function selectPlaylist(context: vscode.ExtensionContext): Promise<void> {
+function clearSearchFilters(): void {
   const session = activeSession();
+  if (!session) {
+    return;
+  }
+  session.activeFilter = undefined;
+  session.testResultFilter = createDefaultTestResultFilter();
+  session.treeDirty = true;
+  renderTree();
+  void updateContexts();
+}
+
+function applyResultFilter(key: TestResultFilterKey, checked: boolean): void {
+  const session = activeSession();
+  if (!session || session.testResultFilter[key] === checked) {
+    return;
+  }
+  session.testResultFilter[key] = checked;
+  session.treeDirty = true;
+  renderTree();
+  void updateContexts();
+}
+
+async function selectPlaylist(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
   if (!session?.knownTests) {
     vscode.window.showInformationMessage('Discover tests from the selected solution first.');
     return;
@@ -628,8 +688,7 @@ async function selectPlaylist(context: vscode.ExtensionContext): Promise<void> {
   await saveSessions(context);
 }
 
-async function clearPlaylist(context: vscode.ExtensionContext): Promise<void> {
-  const session = activeSession();
+async function clearPlaylist(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -681,8 +740,7 @@ function watchPlaylistFile(session: SolutionSession): void {
   }
 }
 
-async function refreshActive(): Promise<void> {
-  const session = activeSession();
+async function refreshSolution(session: SolutionSession | undefined): Promise<void> {
   if (!session) {
     vscode.window.showInformationMessage('No solution selected. Add a solution first.');
     return;
@@ -711,8 +769,7 @@ async function savePlaylistAs(): Promise<void> {
   vscode.window.showInformationMessage(`Playlist saved: ${path.basename(uri.fsPath)} (${fqns.length} test(s)).`);
 }
 
-async function selectRunsettings(context: vscode.ExtensionContext): Promise<void> {
-  const session = activeSession();
+async function selectRunsettings(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -732,8 +789,7 @@ async function selectRunsettings(context: vscode.ExtensionContext): Promise<void
   await updateContexts();
 }
 
-async function clearRunsettings(context: vscode.ExtensionContext): Promise<void> {
-  const session = activeSession();
+async function clearRunsettings(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -910,6 +966,7 @@ async function updateViewState(): Promise<void> {
     defaultRunsettingsAvailable: session ? findDefaultRunsettings(session.solutionPath) !== undefined : false,
     hasExplicitRunsettings: session?.runsettingsMode === 'custom' && session.runsettingsPath !== undefined,
     filter: session?.activeFilter?.raw ?? '',
+    resultFilter: session?.testResultFilter ?? createDefaultTestResultFilter(),
     notFoundTests: session?.notFoundTests ?? [],
     customRunsettings: customView,
     skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true)
