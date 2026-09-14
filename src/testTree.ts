@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { PlaylistTest } from './playlistParser';
 import { SourceLocation } from './sourceScan';
+import { TestResultState } from './testResultFilter';
 
 export const PLACEHOLDER_ID = 'placeholder';
 
@@ -34,6 +35,98 @@ function solutionLabel(solutionPath: string): string {
 export interface SolutionTreeOptions {
   locations?: Map<string, SourceLocation>;
   projects?: Map<string, string>;
+  testResultStates?: ReadonlyMap<string, TestResultState>;
+}
+
+export function formatGroupLabel(baseLabel: string, passed: number, total: number): string {
+  return `${baseLabel} (${passed}/${total})`;
+}
+
+/**
+ * Recalculates and updates labels on all ancestor group nodes of the given test item.
+ * Skips counting tests with 'skipped' state.
+ */
+export function updateGroupLabels(root: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): void {
+  function computeGroup(item: vscode.TestItem): { passed: number; total: number } {
+    if (item.children.size === 0) {
+      // Leaf test item
+      const fqn = fqnFromTestItemId(item.id);
+      const state = (fqn ? testResultStates.get(fqn) : undefined) ?? 'notRun';
+      if (state === 'skipped') {
+        return { passed: 0, total: 0 };
+      }
+      return { passed: state === 'passed' ? 1 : 0, total: 1 };
+    }
+
+    let groupPassed = 0;
+    let groupTotal = 0;
+    item.children.forEach(child => {
+      const childCounts = computeGroup(child);
+      groupPassed += childCounts.passed;
+      groupTotal += childCounts.total;
+    });
+
+    const base = item.sortText ?? item.label;
+    item.sortText = base;
+    item.label = formatGroupLabel(base, groupPassed, groupTotal);
+
+    return { passed: groupPassed, total: groupTotal };
+  }
+
+  computeGroup(root);
+}
+
+/**
+ * Updates group labels from the test item up through all of its ancestors (class, project, solution root).
+ * Skips counting tests with 'skipped' state.
+ */
+export function updateAncestorGroupLabels(test: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): void {
+  let current = test.parent;
+  while (current) {
+    updateSingleGroupLabel(current, testResultStates);
+    current = current.parent;
+  }
+}
+
+function countGroupTests(group: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): { passed: number; total: number } {
+  let passed = 0;
+  let total = 0;
+
+  function walk(item: vscode.TestItem): void {
+    if (item.children.size === 0) {
+      const fqn = fqnFromTestItemId(item.id);
+      const state = (fqn ? testResultStates.get(fqn) : undefined) ?? 'notRun';
+      if (state !== 'skipped') {
+        total += 1;
+        if (state === 'passed') {
+          passed += 1;
+        }
+      }
+      return;
+    }
+    item.children.forEach(child => walk(child));
+  }
+
+  walk(group);
+  return { passed, total };
+}
+
+export function updateSingleGroupLabel(group: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): void {
+  const counts = countGroupTests(group, testResultStates);
+  const base = group.sortText ?? group.label;
+  group.sortText = base;
+  group.label = formatGroupLabel(base, counts.passed, counts.total);
+}
+
+function fqnFromTestItemId(id: string): string | undefined {
+  if (!id.startsWith('test:')) {
+    return undefined;
+  }
+  const parts = id.split(':');
+  if (parts.length < 3) {
+    return undefined;
+  }
+  return decodeURIComponent(parts.slice(2).join(':'));
 }
 
 /**
@@ -90,6 +183,7 @@ export function buildSolutionTree(
   }
 
   sortChildrenRecursively(root);
+  updateGroupLabels(root, options?.testResultStates ?? new Map());
   return root;
 }
 
