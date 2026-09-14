@@ -2,7 +2,7 @@
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
   "description": "Filter, run, and debug tests from .NET solutions using Visual Studio playlists, advanced filters, and runsettings.",
-  "version": "1.14.1",
+  "version": "1.17.7",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "GPL-3.0-only",
@@ -32,10 +32,40 @@
           "minimum": 1,
           "description": "Number of tests per 'dotnet test' invocation. Lower values give more frequent result updates at the cost of extra process startup time."
         },
+        "dotnetTestingPlus.playlistSaveFormat": {
+          "type": "string",
+          "enum": [
+            "v2",
+            "v1"
+          ],
+          "default": "v2",
+          "enumDescriptions": [
+            "V2 rule-based playlist with FullyQualifiedName properties (what Visual Studio writes).",
+            "Legacy <Add Test=\"...\"/> entries."
+          ],
+          "description": "File format written by 'Save As Playlist'."
+        },
         "dotnetTestingPlus.skipPreBreakpoint": {
           "type": "boolean",
           "default": true,
           "description": "When debugging, automatically continue past the test host's initial Debugger.Break() (triggered by VSTEST_HOST_DEBUG) so the run starts without a manual Continue."
+        },
+        "dotnetTestingPlus.controlApiEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable or disable the local JSON HTTP control API for external agents and tools."
+        },
+        "dotnetTestingPlus.controlApiPort": {
+          "type": "number",
+          "default": 48265,
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Port for the local JSON control API (default: 48265). Enabling the API is controlled by 'dotnetTestingPlus.controlApiEnabled'. The API binds to 127.0.0.1 inside the extension host and exposes extension state plus run controls for external tools such as OpenCode."
+        },
+        "dotnetTestingPlus.controlApiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token the control API requires in the Authorization header. Leave empty to disable auth (the API still only accepts loopback connections)."
         }
       }
     },
@@ -106,6 +136,11 @@
         "category": ".NET Testing+",
         "icon": "$(debug-alt)",
         "enablement": "dotnetTestingPlus.solutionReady"
+      },
+      {
+        "command": "dotnet-testing-plus.installAgentSkill",
+        "title": "Install Agent Skill...",
+        "category": ".NET Testing+"
       }
     ],
     "views": {
@@ -127,13 +162,18 @@
         },
         {
           "command": "dotnet-testing-plus.refresh",
-          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.solutionReady",
+          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.hasSolution && !dotnetTestingPlus.solutionLoading",
           "group": "navigation@2"
         },
         {
           "command": "dotnet-testing-plus.showOutput",
           "when": "view == dotnet-testing-plus.view",
           "group": "1_overflow@1"
+        },
+        {
+          "command": "dotnet-testing-plus.installAgentSkill",
+          "when": "view == dotnet-testing-plus.view",
+          "group": "1_overflow@2"
         }
       ]
     }
