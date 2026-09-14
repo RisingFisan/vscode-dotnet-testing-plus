@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as path from 'path';
 import { log, logCommand } from './logger';
+import { killProcessTree } from './processTree';
 
 const LIST_TESTS_TIMEOUT_MS = 15 * 60 * 1000;
 const MARKER = 'The following Tests are available:';
@@ -96,7 +97,7 @@ function runListTests(
     );
     token?.onCancellationRequested(() => {
       log('[cancel] dotnet test discovery cancelled');
-      child.kill();
+      killProcessTree(child);
     });
   });
 }

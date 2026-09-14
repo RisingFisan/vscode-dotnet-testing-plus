@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 import { XMLParser } from 'fast-xml-parser';
 import { log, logCommand } from './logger';
+import { killProcessTree } from './processTree';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 
@@ -43,7 +44,7 @@ interface RunOptions {
   descriptors?: Map<string, TestDescriptor>;
   /** Auto-continue past the test host's initial Debugger.Break() when debugging. */
   skipPreBreakpoint?: boolean;
-  onTestStateChange?: (test: vscode.TestItem, state: TestResultState) => void;
+  onTestStateChange?: (test: vscode.TestItem, state: TestResultState, durationMs?: number) => void;
 }
 
 function asArray<T>(value: T | T[] | undefined): T[] {
@@ -57,8 +58,8 @@ function appendOutput(run: vscode.TestRun, text: string): void {
   run.appendOutput(text.replace(/\r?\n/g, '\r\n'));
 }
 
-function setTestState(options: RunOptions | undefined, test: vscode.TestItem, state: TestResultState): void {
-  options?.onTestStateChange?.(test, state);
+function setTestState(options: RunOptions | undefined, test: vscode.TestItem, state: TestResultState, durationMs?: number): void {
+  options?.onTestStateChange?.(test, state, durationMs);
 }
 
 function skipTest(run: vscode.TestRun, test: vscode.TestItem, options?: RunOptions): void {
@@ -282,11 +283,11 @@ function reportOutcome(
   ctx.reported.add(test.id);
   switch (outcome) {
     case 'Passed':
-      setTestState(ctx.options, test, 'passed');
+      setTestState(ctx.options, test, 'passed', durationMs);
       ctx.run.passed(test, durationMs);
       break;
     case 'Failed': {
-      setTestState(ctx.options, test, 'failed');
+      setTestState(ctx.options, test, 'failed', durationMs);
       const message = new vscode.TestMessage(failure?.message ?? 'Test failed');
       const frames = failure?.stackTrace ? parseStackTrace(failure.stackTrace) : [];
       if (frames.length > 0) {
@@ -498,7 +499,7 @@ function buildSolutionOnce(
     });
     token.onCancellationRequested(() => {
       log('[cancel] dotnet build cancelled');
-      child.kill();
+      killProcessTree(child);
       reject(new Error('Build cancelled'));
     });
   });
@@ -648,7 +649,7 @@ function runDotnetTest(
     });
     token.onCancellationRequested(() => {
       log('[cancel] dotnet test run cancelled');
-      child.kill();
+      killProcessTree(child);
     });
   });
 }
@@ -717,7 +718,7 @@ function debugDotnetTest(
       }
     });
     token.onCancellationRequested(() => {
-      child.kill();
+      killProcessTree(child);
       settle();
     });
   });
@@ -776,7 +777,7 @@ async function attachDebugger(
   if (!started) {
     log('Debugger attach failed. Is the C# extension installed?');
     tracker?.dispose();
-    child.kill();
+    killProcessTree(child);
     settle(new Error('Could not start the debugger. Is the C# extension installed?'));
     return;
   }
@@ -786,7 +787,7 @@ async function attachDebugger(
     if (session.name === sessionName) {
       disposable.dispose();
       tracker?.dispose();
-      child.kill();
+      killProcessTree(child);
       settle();
     }
   });
