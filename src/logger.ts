@@ -1,6 +1,15 @@
 import * as vscode from 'vscode';
 
 let channel: vscode.OutputChannel | undefined;
+const recentLines: string[] = [];
+const MAX_RECENT_LINES = 500;
+
+export function recentLogLines(limit = 200): string[] {
+  if (limit <= 0) {
+    return [];
+  }
+  return recentLines.slice(-limit);
+}
 
 export function initLogger(): void {
   if (!channel) {
@@ -16,7 +25,12 @@ export function showLog(): void {
 export function log(message: string): void {
   initLogger();
   const timestamp = new Date().toISOString();
-  channel?.appendLine(`[${timestamp}] ${message}`);
+  const line = `[${timestamp}] ${message}`;
+  channel?.appendLine(line);
+  recentLines.push(line);
+  if (recentLines.length > MAX_RECENT_LINES) {
+    recentLines.splice(0, recentLines.length - MAX_RECENT_LINES);
+  }
 }
 
 export function logCommand(program: string, args: string[], cwd?: string, env?: Record<string, string>): void {
