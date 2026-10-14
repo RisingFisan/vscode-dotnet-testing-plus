@@ -3,16 +3,21 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { parsePlaylist, serializePlaylist, expandPlaylist, entryFromKnownTestFqn, ParsedPlaylist, PlaylistSaveFormat, PlaylistTest } from './playlistParser';
-import { runPlaylistTests, SolutionRunOptions, TestDescriptor } from './testRunner';
+import { runPlaylistTests, SolutionRunOptions, TestDescriptor, TestFailureLocations } from './testRunner';
 import { SolutionCache } from './cache';
-import { parseSolution } from './solutionParser';
+import { fingerprintFqns } from './fileScanCache';
+import { killAllTrackedChildren } from './processTree';
+import { parseSolutionFile } from './solutionParser';
 import { resolveSolutionSilently, pickSolutionInteractively } from './solutionManager';
 import { discoverSolutionTests, stripTestParameters } from './solutionDiscovery';
-import { buildMethodIndex, SourceLocation } from './sourceScan';
-import { buildSolutionPlaceholder, buildSolutionTree, testItemId, updateAncestorGroupLabels } from './testTree';
+import { CodeLensHandle, registerCodeLenses } from './codeLens';
+import { coverageDetailsFor } from './coverage';
+import { SourceLocation } from './sourceScan';
+import { buildMethodIndex } from './astScan';
+import { buildSolutionPlaceholder, buildSolutionTree, testItemId, updateGroupLabels } from './testTree';
 import { initLogger, showLog, log, recentLogLines } from './logger';
 import { startControlApi, ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiState, ControlApiTest } from './controlApi';
-import { MainViewProvider, MainViewAction, RunsettingsMode, ScreenshotExportSettings } from './mainView';
+import { MainViewProvider, MainViewAction, ScreenshotExportSettings } from './mainView';
 import { TestFilter, parseTestFilter, filterEntries } from './testFilter';
 import { TestResultFilter, TestResultFilterKey, TestResultState, createDefaultTestResultFilter, isTestResultVisible } from './testResultFilter';
 import { buildScreenshotSnapshot, ScreenshotOptions } from './screenshot';
@@ -20,12 +25,15 @@ import { installAgentSkill } from './skillInstaller';
 import {
   findDefaultRunsettings,
   hasCustomRunsettings,
+  hasPermanentRunsettings,
   inspectRunsettings,
   materializeRunsettings,
   normalizeCustomRunsettingsState,
+  normalizePermanentRunsettingsConfig,
   validateCustomParameterName,
   CustomRunsettingsState,
-  CustomRunsettingsViewState
+  CustomRunsettingsViewState,
+  PermanentRunsettingsConfig
 } from './runsettingsManager';
 
 const SESSIONS_KEY = 'dotnet-testing-plus.sessions';
@@ -34,7 +42,6 @@ const ACTIVE_SESSION_KEY = 'dotnet-testing-plus.activeSession';
 const LEGACY_SOLUTION_PATH_KEY = 'dotnet-testing-plus.solutionPath';
 const LEGACY_PLAYLIST_PATH_KEY = 'dotnet-testing-plus.playlistPath';
 const LEGACY_RUNSETTINGS_PATH_KEY = 'dotnet-testing-plus.runsettingsPath';
-const LEGACY_RUNSETTINGS_MODE_KEY = 'dotnet-testing-plus.runsettingsMode';
 const LEGACY_CUSTOM_RUNSETTINGS_KEY = 'dotnet-testing-plus.customRunsettings';
 const READY_CONTEXT_KEY = 'dotnetTestingPlus.solutionReady';
 const LOADING_CONTEXT_KEY = 'dotnetTestingPlus.solutionLoading';
@@ -44,8 +51,8 @@ interface PersistedSession {
   solutionPath: string;
   playlistPath?: string;
   runsettingsPath?: string;
-  runsettingsMode?: RunsettingsMode;
   customRunsettings?: unknown;
+  permanentRunsettings?: unknown;
 }
 
 interface PlaylistExpansionCache {
@@ -62,8 +69,8 @@ interface SolutionSession {
   playlist?: ParsedPlaylist;
   playlistExpansion?: PlaylistExpansionCache;
   runsettingsPath?: string;
-  runsettingsMode: RunsettingsMode;
   customRunsettings: CustomRunsettingsState;
+  permanentRunsettings: PermanentRunsettingsConfig;
   activeFilter?: TestFilter;
   testResultFilter: TestResultFilter;
   testResultStates: Map<string, TestResultState>;
@@ -72,6 +79,7 @@ interface SolutionSession {
   testLocations: Map<string, SourceLocation>;
   testProjects: Map<string, string>;
   notFoundTests: string[];
+  discoveredCount?: number;
   message?: string;
   playlistWatcher?: fs.FSWatcher;
   playlistReloadTimer?: NodeJS.Timeout;
@@ -79,6 +87,18 @@ interface SolutionSession {
   runsettingsReloadTimer?: NodeJS.Timeout;
   treeRoot?: vscode.TestItem;
   treeDirty: boolean;
+  /** Bumped on every result-state change; invalidates cached visible entries while a result filter hides anything. */
+  statesVersion: number;
+  /** Per-known-test entries (no playlist), reused until discovery results change. */
+  baseEntries?: { known: ReadonlySet<string>; projects: Map<string, string>; entries: PlaylistTest[] };
+  /** Last filtered entry list and the inputs it was computed from. */
+  visibleEntries?: {
+    base: PlaylistTest[];
+    filter: TestFilter | undefined;
+    filterSignature: string;
+    statesVersion: number;
+    entries: PlaylistTest[];
+  };
 }
 
 let controller: vscode.TestController;
@@ -89,14 +109,19 @@ let mainView: MainViewProvider;
 const sessions = new Map<string, SolutionSession>();
 let activeSessionKey: string | undefined;
 let searchAllSolutions = false;
-let activeRunCts: vscode.CancellationTokenSource | undefined;
+// Every in-flight run (UI, CodeLens or API); Cancel and deactivate stop them all.
+const activeRuns = new Set<vscode.CancellationTokenSource>();
+// Solutions with a run in flight: a second run on the same solution is refused.
+const runningSolutions = new Set<string>();
 let controlApi: vscode.Disposable | undefined;
 let controlApiRunningPort: number | undefined;
 let controlApiSessionEnabled = false;
+let codeLenses: CodeLensHandle | undefined;
+const failureLocations = new Map<string, TestFailureLocations>();
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.17.7, multi-solution discovery)');
+  log('Extension activated (v1.21.3, multi-solution discovery)');
   extensionContext = context;
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -110,6 +135,15 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     controller.createRunProfile('Run', vscode.TestRunProfileKind.Run, (request, token) => runWithSolutions(request, token, false), true),
     controller.createRunProfile('Debug', vscode.TestRunProfileKind.Debug, (request, token) => runWithSolutions(request, token, true), true),
+    (() => {
+      const profile = controller.createRunProfile('Run with Coverage', vscode.TestRunProfileKind.Coverage, (request, token) => runWithSolutions(request, token, false), true);
+      profile.loadDetailedCoverage = async (_run, fileCoverage) => coverageDetailsFor(fileCoverage);
+      return profile;
+    })(),
+    vscode.commands.registerCommand('dotnet-testing-plus.runTestFromCodeLens', (sessionKey?: string, fqn?: string) =>
+      runTestFromCodeLens(sessionKey, fqn, false)),
+    vscode.commands.registerCommand('dotnet-testing-plus.debugTestFromCodeLens', (sessionKey?: string, fqn?: string) =>
+      runTestFromCodeLens(sessionKey, fqn, true)),
     vscode.commands.registerCommand('dotnet-testing-plus.addSolution', () => addSolution(context)),
     vscode.commands.registerCommand('dotnet-testing-plus.removeSolution', async () => {
       const session = await pickLoadedSession('Select a solution to unload');
@@ -125,6 +159,12 @@ export function activate(context: vscode.ExtensionContext): void {
       const session = await pickLoadedSession('Select a solution for runsettings');
       if (session) {
         await selectRunsettings(context, session);
+      }
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.useDefaultRunsettings', async () => {
+      const session = await pickLoadedSession('Select a solution to use default runsettings');
+      if (session) {
+        await useDefaultRunsettings(context, session);
       }
     }),
     vscode.commands.registerCommand('dotnet-testing-plus.clearRunsettings', async () => {
@@ -154,6 +194,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dotnet-testing-plus.showOutput', () => showLog()),
     vscode.commands.registerCommand('dotnet-testing-plus.runAll', () => runAllTests(false)),
     vscode.commands.registerCommand('dotnet-testing-plus.debugAll', () => runAllTests(true)),
+    vscode.commands.registerCommand('dotnet-testing-plus.goToCallSite', async (item?: vscode.TestItem) => {
+      await navigateToFailureLocation(item, 'callSite');
+    }),
+    vscode.commands.registerCommand('dotnet-testing-plus.goToErrorLocation', async (item?: vscode.TestItem) => {
+      await navigateToFailureLocation(item, 'innermostError');
+    }),
     vscode.commands.registerCommand('dotnet-testing-plus.installAgentSkill', () => installAgentSkill(extensionPath)),
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('dotnetTestingPlus.skipPreBreakpoint')) {
@@ -169,15 +215,21 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     new vscode.Disposable(() => controlApi?.dispose())
   );
+  codeLenses = registerCodeLenses(() => [...sessions.values()]);
+  context.subscriptions.push(codeLenses);
 
   syncControlApi(context);
   void restoreState(context);
 }
 
 export function deactivate(): void {
+  // Stop in-flight runs and kill their process trees synchronously: closing the
+  // window must not leave dotnet/testhost processes behind.
+  cancelAllRuns();
   for (const session of sessions.values()) {
     disposeSession(session);
   }
+  killAllTrackedChildren();
 }
 
 function canonicalPath(file: string): string {
@@ -187,32 +239,25 @@ function canonicalPath(file: string): string {
 function createSession(saved: PersistedSession): SolutionSession {
   const solutionPath = canonicalPath(saved.solutionPath);
   const customRunsettings = normalizeCustomRunsettingsState(saved.customRunsettings);
+  const permanentRunsettings = normalizePermanentRunsettingsConfig(saved.permanentRunsettings);
   const runsettingsPath = saved.runsettingsPath && fs.existsSync(saved.runsettingsPath)
     ? saved.runsettingsPath
     : undefined;
-  const savedMode = normalizeRunsettingsMode(saved.runsettingsMode);
-  let runsettingsMode = savedMode
-    ?? (runsettingsPath ? 'custom' : hasCustomRunsettings(customRunsettings) ? 'override' : 'default');
-  if (runsettingsMode !== 'custom' && !findDefaultRunsettings(solutionPath)) {
-    runsettingsMode = 'custom';
-  }
-  if (runsettingsMode === 'override') {
-    customRunsettings.sourcePath = findDefaultRunsettings(solutionPath);
-  }
   return {
     key: solutionPath,
     solutionPath,
     playlistPath: saved.playlistPath && fs.existsSync(saved.playlistPath) ? saved.playlistPath : undefined,
     runsettingsPath,
-    runsettingsMode,
     customRunsettings,
+    permanentRunsettings,
     testResultFilter: createDefaultTestResultFilter(),
     testResultStates: new Map(),
     testDurations: new Map(),
     testLocations: new Map(),
     testProjects: new Map(),
     notFoundTests: [],
-    treeDirty: true
+    treeDirty: true,
+    statesVersion: 0
   };
 }
 
@@ -257,8 +302,8 @@ function persistedSessions(): PersistedSession[] {
     solutionPath: session.solutionPath,
     playlistPath: session.playlistPath,
     runsettingsPath: session.runsettingsPath,
-    runsettingsMode: session.runsettingsMode,
-    customRunsettings: session.customRunsettings
+    customRunsettings: session.customRunsettings,
+    permanentRunsettings: session.permanentRunsettings
   }));
 }
 
@@ -296,9 +341,14 @@ async function restoreState(context: vscode.ExtensionContext): Promise<void> {
   await saveSessions(context);
   renderTree();
   await updateContexts();
-  for (const session of sessions.values()) {
-    void discover(session, false);
-  }
+  // One solution at a time: each cache miss runs dotnet test --list-tests,
+  // which builds the whole solution; several at once would thrash the machine
+  // right at startup.
+  void (async () => {
+    for (const session of [...sessions.values()]) {
+      await discover(session, false);
+    }
+  })();
 }
 
 function isPersistedSession(value: unknown): value is PersistedSession {
@@ -314,7 +364,6 @@ function createLegacySession(context: vscode.ExtensionContext): PersistedSession
     solutionPath,
     playlistPath: context.workspaceState.get<string>(LEGACY_PLAYLIST_PATH_KEY),
     runsettingsPath: context.workspaceState.get<string>(LEGACY_RUNSETTINGS_PATH_KEY),
-    runsettingsMode: normalizeRunsettingsMode(context.workspaceState.get<unknown>(LEGACY_RUNSETTINGS_MODE_KEY)),
     customRunsettings: context.workspaceState.get<unknown>(LEGACY_CUSTOM_RUNSETTINGS_KEY)
   };
 }
@@ -352,6 +401,7 @@ async function removeSolution(context: vscode.ExtensionContext, key?: string): P
     return;
   }
   disposeSession(session);
+  runsettingsViewCache.delete(session.key);
   sessions.delete(session.key);
   if (sessions.size <= 1) {
     searchAllSolutions = false;
@@ -388,34 +438,48 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
   }
   const cts = new vscode.CancellationTokenSource();
   session.discoveryCts = cts;
+  session.discoveredCount = undefined;
   session.message = 'Loading solution tests...';
   session.treeDirty = true;
   renderTree();
   await updateContexts();
   try {
     let projectPaths: string[] = [];
+    let cachePaths: string[] = [];
     try {
-      projectPaths = parseSolution(session.solutionPath).map(project => project.path);
+      const parsed = parseSolutionFile(session.solutionPath);
+      projectPaths = parsed.projects.map(project => project.path);
+      cachePaths = [...projectPaths, ...parsed.cacheDependencies];
     } catch (err) {
       log(`Could not parse solution for cache validation: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const { methodIndex, locations, projects } = buildMethodIndex(projectPaths);
+    const { methodIndex, locations, projects, parserVersion } = await buildMethodIndex(
+      projectPaths,
+      extensionPath,
+      extensionContext?.globalStorageUri.fsPath
+    );
+    if (cts.token.isCancellationRequested) {
+      throw new Error('Discovery cancelled');
+    }
     session.testLocations = locations;
     session.testProjects = projects;
-    const cached = force ? undefined : cache.get(session.solutionPath, projectPaths);
+    // The cached list is keyed on .sln/.csproj mtimes, which a source edit never
+    // touches; the scan's FQN set tells us when tests were added or removed.
+    const scanFingerprint = fingerprintFqns(locations.keys());
+    const cached = force ? undefined : cache.get(session.solutionPath, cachePaths, parserVersion, scanFingerprint);
     if (cached && cached.length > 0) {
       session.knownTests = new Set(cached);
       log(`Using cached test list for ${session.solutionPath} (${cached.length} tests)`);
     } else {
-      const discoveredNames = await vscode.window.withProgress(
-        {
-          location: { viewId: 'workbench.view.testing' },
-          title: `Loading solution tests from ${path.basename(session.solutionPath)}...`,
-          cancellable: true
-        },
-        (_progress, progressToken) => {
-          progressToken.onCancellationRequested(() => cts.cancel());
-          return discoverSolutionTests(session.solutionPath, cts.token);
+      const discoveredNames = await discoverSolutionTests(
+        session.solutionPath,
+        cts.token,
+        count => {
+          session.discoveredCount = count;
+          session.message = `Finding tests... (${count} found)`;
+          session.treeDirty = true;
+          renderTree();
+          void updateViewState();
         }
       );
       const tests = new Set<string>();
@@ -432,10 +496,11 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
       log(`Mapped ${tests.size - unmapped} tests to fully-qualified names (${unmapped} unmapped) in ${path.basename(session.solutionPath)}`);
       session.knownTests = tests;
       if (tests.size > 0) {
-        cache.set(session.solutionPath, projectPaths, [...tests]);
+        cache.set(session.solutionPath, cachePaths, [...tests], parserVersion, scanFingerprint);
         cache.save();
       }
     }
+    session.discoveredCount = undefined;
     session.message = undefined;
     session.treeDirty = true;
     if (session.playlistPath) {
@@ -443,6 +508,7 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
     }
   } catch (err) {
     session.knownTests = undefined;
+    session.discoveredCount = undefined;
     session.message = cts.token.isCancellationRequested
       ? 'Solution loading stopped'
       : 'Test discovery failed - check the output';
@@ -467,6 +533,7 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
   if (!session.knownTests) {
     return [];
   }
+  let base: PlaylistTest[];
   if (session.playlistPath) {
     if (!session.playlistExpansion || session.playlistExpansion.knownTests !== session.knownTests) {
       const expansion = session.playlist
@@ -475,20 +542,50 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
       session.playlistExpansion = { knownTests: session.knownTests, entries: expansion.entries, notFound: expansion.notFound };
     }
     session.notFoundTests = session.playlistExpansion.notFound;
-    return filterEntries(session.playlistExpansion.entries, session.activeFilter)
-      .filter(entry => isTestResultVisible(session.testResultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
+    base = session.playlistExpansion.entries;
+  } else {
+    session.notFoundTests = [];
+    // Building an entry per known test is O(N); reuse it until the discovered
+    // tests or their project mapping change.
+    if (
+      !session.baseEntries ||
+      session.baseEntries.known !== session.knownTests ||
+      session.baseEntries.projects !== session.testProjects
+    ) {
+      const entries: PlaylistTest[] = [];
+      for (const fqn of session.knownTests) {
+        entries.push(entryFromKnownTestFqn(fqn, session.testProjects.get(fqn)));
+      }
+      session.baseEntries = { known: session.knownTests, projects: session.testProjects, entries };
+    }
+    base = session.baseEntries.entries;
   }
-  session.notFoundTests = [];
-  const entries: PlaylistTest[] = [];
-  for (const fqn of session.knownTests) {
-    entries.push(entryFromKnownTestFqn(fqn, session.testProjects.get(fqn)));
+  // This is called from many hot paths (view refreshes, run setup, CodeLens,
+  // screenshot checks). Reuse the filtered result while none of its inputs
+  // changed. Result states only matter when the result filter hides something.
+  const resultFilter = session.testResultFilter;
+  const filterSignature = JSON.stringify(resultFilter);
+  const statesMatter = !(resultFilter.passing && resultFilter.failing && resultFilter.notRun && resultFilter.skipped);
+  const statesVersion = statesMatter ? session.statesVersion : -1;
+  const cached = session.visibleEntries;
+  if (
+    cached &&
+    cached.base === base &&
+    cached.filter === session.activeFilter &&
+    cached.filterSignature === filterSignature &&
+    cached.statesVersion === statesVersion
+  ) {
+    return cached.entries;
   }
-  return filterEntries(entries, session.activeFilter)
-    .filter(entry => isTestResultVisible(session.testResultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
+  const entries = filterEntries(base, session.activeFilter)
+    .filter(entry => isTestResultVisible(resultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
+  session.visibleEntries = { base, filter: session.activeFilter, filterSignature, statesVersion, entries };
+  return entries;
 }
 
 function renderTree(): void {
   const roots: vscode.TestItem[] = [];
+  let rebuilt = false;
   for (const session of sessions.values()) {
     if (session.treeDirty || !session.treeRoot) {
       session.treeRoot = session.knownTests
@@ -499,15 +596,21 @@ function renderTree(): void {
         })
         : buildSolutionPlaceholder(controller, session.solutionPath, session.message ?? 'Waiting to load solution tests');
       session.treeDirty = false;
+      rebuilt = true;
     }
     roots.push(session.treeRoot);
   }
   controller.items.replace(roots);
+  if (rebuilt) {
+    // Only re-evaluate CodeLens when tree contents actually changed; result
+    // updates during a run call renderTree repeatedly without rebuilding.
+    codeLenses?.notify();
+  }
 }
 
-function collectLeafItems(scope?: vscode.TestItem): vscode.TestItem[] {
+function collectLeafItems(scope?: vscode.TestItem, knownDescriptors?: ReadonlyMap<string, TestDescriptor>): vscode.TestItem[] {
   const leaves: vscode.TestItem[] = [];
-  const descriptors = collectDescriptors();
+  const descriptors = knownDescriptors ?? collectDescriptors();
   const walk = (item: vscode.TestItem): void => {
     if (item.children.size > 0) {
       item.children.forEach(walk);
@@ -542,33 +645,66 @@ function collectDescriptors(): Map<string, TestDescriptor> {
   return descriptors;
 }
 
-async function runWithSolutions(request: vscode.TestRunRequest, token: vscode.CancellationToken, debug: boolean): Promise<void> {
-  const descriptors = collectDescriptors();
+async function runWithSolutions(
+  request: vscode.TestRunRequest,
+  token: vscode.CancellationToken,
+  debug: boolean,
+  knownDescriptors?: Map<string, TestDescriptor>
+): Promise<void> {
+  const descriptors = knownDescriptors ?? collectDescriptors();
   if (descriptors.size === 0) {
     vscode.window.showInformationMessage('Discover tests from at least one solution first.');
     return;
   }
+  // Two runs on one solution would race on `dotnet build` file locks and on the
+  // TestResults folder; refuse the second instead of corrupting both.
+  const requestedSolutions = collectRequestedSolutionPaths(request, descriptors);
+  const busy = [...requestedSolutions].filter(solutionPath => runningSolutions.has(solutionPath));
+  if (busy.length > 0) {
+    vscode.window.showInformationMessage(
+      `A test run is already in progress for ${busy.map(item => path.basename(item)).join(', ')}. Wait for it to finish or cancel it first.`
+    );
+    return;
+  }
   const runCts = new vscode.CancellationTokenSource();
   const forwardCancel = token.onCancellationRequested(() => runCts.cancel());
-  activeRunCts = runCts;
+  activeRuns.add(runCts);
+  requestedSolutions.forEach(solutionPath => runningSolutions.add(solutionPath));
   try {
-    await executeSolutionRun(request, runCts.token, debug, descriptors);
+    await executeSolutionRun(request, runCts.token, debug, descriptors, requestedSolutions);
   } finally {
     forwardCancel.dispose();
-    if (activeRunCts === runCts) {
-      activeRunCts = undefined;
-    }
+    activeRuns.delete(runCts);
+    requestedSolutions.forEach(solutionPath => runningSolutions.delete(solutionPath));
     runCts.dispose();
   }
 }
+
+function cancelAllRuns(): void {
+  for (const cts of [...activeRuns]) {
+    cts.cancel();
+  }
+}
+
+// Tree rebuilds and group-label passes walk every test; during a run they are
+// coalesced to at most one per interval instead of one per result.
+const RENDER_THROTTLE_MS = 250;
+const LABEL_THROTTLE_MS = 300;
 
 async function executeSolutionRun(
   request: vscode.TestRunRequest,
   token: vscode.CancellationToken,
   debug: boolean,
-  descriptors: Map<string, TestDescriptor>
+  descriptors: Map<string, TestDescriptor>,
+  requestedSolutions: ReadonlySet<string>
 ): Promise<void> {
-  const requestedSolutions = collectRequestedSolutionPaths(request, descriptors);
+  let coverage = request.profile?.kind === vscode.TestRunProfileKind.Coverage;
+  if (coverage && debug) {
+    // vstest cannot attach a debugger and collect coverage at the same time.
+    log('Debugging with the coverage profile enabled: coverage collection is skipped.');
+    vscode.window.setStatusBarMessage('Debug run: coverage collection skipped (not supported while debugging).', 5000);
+    coverage = false;
+  }
   const solutionOptions = new Map<string, SolutionRunOptions>();
   for (const session of sessions.values()) {
     if (session.knownTests && requestedSolutions.has(session.solutionPath)) {
@@ -578,21 +714,47 @@ async function executeSolutionRun(
       });
     }
   }
-  let renderPending = false;
+  let renderTimer: NodeJS.Timeout | undefined;
   let viewStatePending = false;
   let viewStateTimer: NodeJS.Timeout | undefined;
+  let labelTimer: NodeJS.Timeout | undefined;
+  const labelSessions = new Set<SolutionSession>();
   let lastScreenshotBlank = screenshotWouldBeBlank();
 
   const scheduleRender = (): void => {
-    if (renderPending) {
+    if (renderTimer) {
       return;
     }
-    renderPending = true;
-    setTimeout(() => {
-      renderPending = false;
+    renderTimer = setTimeout(() => {
+      renderTimer = undefined;
       renderTree();
       void updateContexts();
-    }, 0);
+    }, RENDER_THROTTLE_MS);
+  };
+
+  // Group labels ("Class (3/10)") need a pass over the whole tree; recomputing
+  // them per result made a run quadratic in the number of tests. The session's
+  // *current* tree is read at flush time, so a rebuild in between is harmless.
+  const flushLabels = (): void => {
+    if (labelTimer) {
+      clearTimeout(labelTimer);
+      labelTimer = undefined;
+    }
+    for (const session of labelSessions) {
+      if (session.knownTests && session.treeRoot) {
+        updateGroupLabels(session.treeRoot, session.testResultStates);
+      }
+    }
+    labelSessions.clear();
+  };
+  const scheduleLabels = (session: SolutionSession): void => {
+    labelSessions.add(session);
+    if (!labelTimer) {
+      labelTimer = setTimeout(() => {
+        labelTimer = undefined;
+        flushLabels();
+      }, LABEL_THROTTLE_MS);
+    }
   };
 
   const scheduleViewStateUpdate = (immediate = false): void => {
@@ -620,9 +782,15 @@ async function executeSolutionRun(
     await runPlaylistTests(controller, request, token, debug, solutionOptions, {
       descriptors,
       loggerDir: extensionPath ? path.join(extensionPath, 'assets', 'logger') : undefined,
-      chunkSize: vscode.workspace.getConfiguration('dotnetTestingPlus').get<number>('chunkSize', 100),
+      coverage,
       skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
+      onTestFailureLocations: (test, locations) => {
+        failureLocations.set(test.id, locations);
+      },
       onTestStateChange: (test, state, durationMs) => {
+        if (state === 'passed' || state === 'skipped') {
+          failureLocations.delete(test.id);
+        }
         const descriptor = descriptors.get(test.id);
         const session = descriptor && sessions.get(descriptor.solutionPath);
         if (!descriptor || !session) {
@@ -630,6 +798,9 @@ async function executeSolutionRun(
         }
         const previous = session.testResultStates.get(descriptor.fullyQualifiedName) ?? 'notRun';
         session.testResultStates.set(descriptor.fullyQualifiedName, state);
+        if (previous !== state) {
+          session.statesVersion++;
+        }
         if (durationMs === undefined) {
           session.testDurations.delete(descriptor.fullyQualifiedName);
         } else {
@@ -649,8 +820,8 @@ async function executeSolutionRun(
         if (isTestResultVisible(session.testResultFilter, previous) !== isTestResultVisible(session.testResultFilter, state)) {
           session.treeDirty = true;
           scheduleRender();
-        } else {
-          updateAncestorGroupLabels(test, session.testResultStates);
+        } else if (session.knownTests && session.treeRoot) {
+          scheduleLabels(session);
         }
       }
     });
@@ -658,6 +829,13 @@ async function executeSolutionRun(
     if (viewStateTimer) {
       clearTimeout(viewStateTimer);
     }
+    // Apply whatever is still pending so the tree ends the run fully current.
+    if (renderTimer) {
+      clearTimeout(renderTimer);
+      renderTimer = undefined;
+      renderTree();
+    }
+    flushLabels();
     void updateContexts();
   }
 }
@@ -689,13 +867,39 @@ function collectRequestedSolutionPaths(
   return paths;
 }
 
+function getPermanentOverrides(session?: SolutionSession): PermanentRunsettingsConfig {
+  if (session) {
+    return session.permanentRunsettings;
+  }
+  return { values: {}, parameters: [] };
+}
+
+async function savePermanentOverrides(context: vscode.ExtensionContext, session: SolutionSession, config: PermanentRunsettingsConfig): Promise<void> {
+  const clean: PermanentRunsettingsConfig = {};
+  if (config.values && Object.keys(config.values).length > 0) {
+    clean.values = config.values;
+  }
+  if (config.parameters && config.parameters.length > 0) {
+    clean.parameters = config.parameters.map(p => ({ id: p.id, name: p.name, value: p.value }));
+  }
+  session.permanentRunsettings = clean;
+  await saveSessions(context);
+}
+
+function clearTemporaryOverrides(session: SolutionSession): void {
+  session.customRunsettings.overrides = {};
+  session.customRunsettings.parameters = [];
+  session.customRunsettings.sourcePath = undefined;
+}
+
 async function resolveRunsettings(session: SolutionSession): Promise<string | undefined> {
   const base = getActiveRunsettings(session);
-  if (session.runsettingsMode !== 'override' || !base || !hasCustomRunsettings(session.customRunsettings)) {
-    return base;
+  if (!base) {
+    return undefined;
   }
+  const permanent = getPermanentOverrides(session);
   const directory = path.join(getCustomRunsettingsStorageDirectory(), 'runsettings', crypto.createHash('sha256').update(session.key).digest('hex'));
-  const materialized = await materializeRunsettings(base, session.customRunsettings, directory);
+  const materialized = await materializeRunsettings(base, session.customRunsettings, directory, permanent);
   if (materialized.unresolved.length > 0) {
     log(`Custom runsettings warnings for ${path.basename(session.solutionPath)}: ${materialized.unresolved.join('; ')}`);
   }
@@ -714,6 +918,42 @@ async function runAllTests(debug: boolean): Promise<void> {
   } finally {
     cts.dispose();
   }
+}
+
+async function runTestFromCodeLens(sessionKey: string | undefined, fqn: string | undefined, debug: boolean): Promise<void> {
+  const session = sessionKey ? sessions.get(sessionKey) : undefined;
+  const item = session?.treeRoot && fqn
+    ? findTreeItem(session.treeRoot, testItemId(session.solutionPath, fqn))
+    : undefined;
+  if (!item) {
+    vscode.window.showInformationMessage('That test is no longer visible in the tree; refresh its solution.');
+    return;
+  }
+  const cts = new vscode.CancellationTokenSource();
+  try {
+    await runWithSolutions(new vscode.TestRunRequest([item]), cts.token, debug);
+  } finally {
+    cts.dispose();
+  }
+}
+
+function findTreeItem(root: vscode.TestItem, id: string): vscode.TestItem | undefined {
+  if (root.id === id) {
+    return root;
+  }
+  for (const child of childrenOf(root)) {
+    const found = findTreeItem(child, id);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+function childrenOf(item: vscode.TestItem): vscode.TestItem[] {
+  const children: vscode.TestItem[] = [];
+  item.children.forEach(child => children.push(child));
+  return children;
 }
 
 function controlApiState(): ControlApiState {
@@ -737,11 +977,14 @@ function controlApiState(): ControlApiState {
       playlistPath: item.playlistPath,
       message: item.message
     })),
-    runInProgress: activeRunCts !== undefined,
+    runInProgress: activeRuns.size > 0,
     filter: session?.activeFilter?.raw ?? '',
     resultCounts,
     notFoundTests: session?.notFoundTests ?? [],
-    runsettings: session ? { mode: session.runsettingsMode, path: getActiveRunsettings(session) } : undefined
+    runsettings: session ? {
+      mode: session.runsettingsPath ? 'custom' : 'default',
+      path: getActiveRunsettings(session)
+    } : undefined
   };
 }
 
@@ -784,6 +1027,8 @@ async function runApiTests(options: ControlApiRunOptions): Promise<ControlApiRun
   if (options.solution && !sessions.has(options.solution)) {
     throw new ControlApiError(404, `Unknown solution key: ${options.solution}`);
   }
+  // Built once and shared with the run itself (it used to be built twice).
+  const descriptors = collectDescriptors();
   const leaves: vscode.TestItem[] = [];
   const missing: string[] = [];
   if (Array.isArray(options.fqns) && options.fqns.length > 0) {
@@ -796,39 +1041,51 @@ async function runApiTests(options: ControlApiRunOptions): Promise<ControlApiRun
         wanted.set(fqn, testItemId(session.solutionPath, fqn));
       }
     }
-    const visible = new Map(collectLeafItems().map(item => [item.id, item] as const));
+    const visible = new Map(collectLeafItems(undefined, descriptors).map(item => [item.id, item] as const));
+    const missingSet = new Set<string>();
     for (const [fqn, id] of wanted) {
       const item = visible.get(id);
       if (item) {
         leaves.push(item);
       } else {
-        missing.push(fqn);
+        missingSet.add(fqn);
       }
     }
     for (const fqn of options.fqns) {
-      if (!wanted.has(fqn) && !missing.includes(fqn)) {
-        missing.push(fqn);
+      if (!wanted.has(fqn)) {
+        missingSet.add(fqn);
       }
     }
+    missing.push(...missingSet);
   } else if (options.all) {
     const scope = options.solution ? sessions.get(options.solution)?.treeRoot : undefined;
-    leaves.push(...collectLeafItems(scope));
+    leaves.push(...collectLeafItems(scope, descriptors));
   } else {
     throw new ControlApiError(400, 'Provide "all": true or a non-empty "fqns" array.');
   }
   if (leaves.length === 0) {
     return { started: false, matched: 0, missing };
   }
+  const busy = new Set<string>();
+  for (const leaf of leaves) {
+    const solutionPath = descriptors.get(leaf.id)?.solutionPath;
+    if (solutionPath && runningSolutions.has(solutionPath)) {
+      busy.add(path.basename(solutionPath));
+    }
+  }
+  if (busy.size > 0) {
+    throw new ControlApiError(409, `A test run is already in progress for: ${[...busy].join(', ')}. Cancel it first.`);
+  }
   const cts = new vscode.CancellationTokenSource();
-  void runWithSolutions(new vscode.TestRunRequest(leaves), cts.token, debug)
+  void runWithSolutions(new vscode.TestRunRequest(leaves), cts.token, debug, descriptors)
     .catch(err => log(`Control API run failed: ${err instanceof Error ? err.message : String(err)}`))
     .finally(() => cts.dispose());
   return { started: true, matched: leaves.length, missing };
 }
 
 function cancelApiRun(options: { loading?: boolean }): { cancelled: boolean; cancelledLoading: boolean } {
-  const cancelled = activeRunCts !== undefined;
-  activeRunCts?.cancel();
+  const cancelled = activeRuns.size > 0;
+  cancelAllRuns();
   let cancelledLoading = false;
   if (options.loading) {
     const session = activeSession();
@@ -915,9 +1172,9 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
     case 'selectScreenshotSavePath': await selectScreenshotSavePath(); break;
     case 'saveScreenshot': await saveScreenshot(action.data, action.savePath); break;
     case 'selectRunsettings': await selectRunsettings(context); break;
+    case 'useDefaultRunsettings': await useDefaultRunsettings(context); break;
     case 'clearRunsettings': await clearRunsettings(context); break;
     case 'openRunsettings': await openActiveRunsettings(); break;
-    case 'setRunsettingsMode': await setRunsettingsMode(context, action.mode); break;
     case 'filter': applyFilterInput(action.text); break;
     case 'toggleSearchAllSolutions': toggleSearchAllSolutions(action.checked); break;
     case 'clearFilter': clearSearchFilters(); break;
@@ -931,9 +1188,11 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
       break;
     case 'setCustomRunsettingsValue': await setCustomRunsettingsValue(context, action.key, action.value); break;
     case 'resetCustomRunsettingsValue': await resetCustomRunsettingsValue(context, action.key); break;
+    case 'toggleLockCustomRunsettingsValue': await toggleLockCustomRunsettingsValue(context, action.key, action.isPermanent); break;
     case 'addCustomRunsettingsParameter': await addCustomRunsettingsParameter(context); break;
     case 'updateCustomRunsettingsParameter': await updateCustomRunsettingsParameter(context, action.id, action.field, action.value); break;
     case 'removeCustomRunsettingsParameter': await removeCustomRunsettingsParameter(context, action.id); break;
+    case 'toggleLockCustomRunsettingsParameter': await toggleLockCustomRunsettingsParameter(context, action.id, action.isPermanent); break;
   }
 }
 
@@ -1068,20 +1327,65 @@ function matchPlaylist(session: SolutionSession, silent = false): void {
   }
 }
 
+/**
+ * `fs.watch` wrapper for single files. An FSWatcher without an 'error'
+ * listener turns any watch failure (e.g. EPERM when the file is deleted on
+ * Windows) into an uncaught exception in the shared extension host. A
+ * 'rename' event also means the file was replaced or removed, which leaves
+ * the watch bound to the old inode on Linux, so `rearm` is invoked shortly
+ * after to attach a fresh watcher.
+ */
+function watchFileSafely(file: string, onChange: () => void, rearm: () => void): fs.FSWatcher | undefined {
+  try {
+    const watcher = fs.watch(file, eventType => {
+      onChange();
+      if (eventType === 'rename') {
+        setTimeout(rearm, 200);
+      }
+    });
+    watcher.on('error', err => {
+      log(`File watcher error for ${path.basename(file)}: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        watcher.close();
+      } catch {
+        // already closed
+      }
+    });
+    return watcher;
+  } catch (err) {
+    // Watching is best-effort; manual refresh remains available.
+    log(`Could not watch ${file}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
 function watchPlaylistFile(session: SolutionSession): void {
   session.playlistWatcher?.close();
-  if (!session.playlistPath) {
+  session.playlistWatcher = undefined;
+  const file = session.playlistPath;
+  if (!file) {
     return;
   }
-  try {
-    session.playlistWatcher = fs.watch(session.playlistPath, () => {
+  session.playlistWatcher = watchFileSafely(
+    file,
+    () => {
       if (session.playlistReloadTimer) {
         clearTimeout(session.playlistReloadTimer);
       }
       session.playlistReloadTimer = setTimeout(() => matchPlaylist(session, true), 500);
-    });
-  } catch {
-    // Watching is best-effort; Refresh Selected remains available.
+    },
+    () => {
+      if (sessions.get(session.key) === session && session.playlistPath === file) {
+        watchPlaylistFile(session);
+      }
+    }
+  );
+  if (!session.playlistWatcher) {
+    setTimeout(() => {
+      if (sessions.get(session.key) === session && session.playlistPath === file && !session.playlistWatcher) {
+        watchPlaylistFile(session);
+      }
+    }, 500);
   }
 }
 
@@ -1221,25 +1525,30 @@ async function selectRunsettings(context: vscode.ExtensionContext, session = act
     return;
   }
   session.runsettingsPath = uris[0].fsPath;
-  session.runsettingsMode = 'custom';
+  clearTemporaryOverrides(session);
+  watchRunsettingsFile(session);
+  await saveSessions(context);
+  await updateContexts();
+}
+
+async function useDefaultRunsettings(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
+  if (!session) {
+    return;
+  }
+  session.runsettingsPath = undefined;
+  clearTemporaryOverrides(session);
   watchRunsettingsFile(session);
   await saveSessions(context);
   await updateContexts();
 }
 
 async function clearRunsettings(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
-  if (!session) {
-    return;
-  }
-  session.runsettingsPath = undefined;
-  watchRunsettingsFile(session);
-  await saveSessions(context);
-  await updateContexts();
+  await useDefaultRunsettings(context, session);
 }
 
 async function openActiveRunsettings(): Promise<void> {
   const session = activeSession();
-  if (!session || (session.runsettingsMode !== 'default' && session.runsettingsMode !== 'custom')) {
+  if (!session) {
     return;
   }
   const filePath = getActiveRunsettings(session);
@@ -1255,32 +1564,14 @@ async function openActiveRunsettings(): Promise<void> {
 }
 
 function getActiveRunsettings(session: SolutionSession): string | undefined {
-  if (session.runsettingsMode === 'custom') {
-    return session.runsettingsPath && fs.existsSync(session.runsettingsPath) ? session.runsettingsPath : undefined;
+  if (session.runsettingsPath && fs.existsSync(session.runsettingsPath)) {
+    return session.runsettingsPath;
   }
   return findDefaultRunsettings(session.solutionPath);
 }
 
 function getOverrideBaseRunsettings(session: SolutionSession): string | undefined {
-  return session.runsettingsMode === 'override' ? findDefaultRunsettings(session.solutionPath) : undefined;
-}
-
-function normalizeRunsettingsMode(value: unknown): RunsettingsMode | undefined {
-  return value === 'default' || value === 'override' || value === 'custom' ? value : undefined;
-}
-
-async function setRunsettingsMode(context: vscode.ExtensionContext, mode: RunsettingsMode): Promise<void> {
-  const session = activeSession();
-  if (!session || mode === session.runsettingsMode || (mode !== 'custom' && !findDefaultRunsettings(session.solutionPath))) {
-    return;
-  }
-  session.runsettingsMode = mode;
-  if (mode === 'override') {
-    session.customRunsettings.sourcePath = findDefaultRunsettings(session.solutionPath);
-  }
-  watchRunsettingsFile(session);
-  await saveSessions(context);
-  await updateContexts();
+  return getActiveRunsettings(session);
 }
 
 function getCustomRunsettingsStorageDirectory(): string {
@@ -1290,13 +1581,19 @@ function getCustomRunsettingsStorageDirectory(): string {
 
 async function setCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, value: string): Promise<void> {
   const session = activeSession();
-  const base = session && getOverrideBaseRunsettings(session);
+  const base = session && getActiveRunsettings(session);
   if (!session || !base) {
     return;
   }
-  session.customRunsettings.sourcePath = base;
-  session.customRunsettings.overrides[key] = value;
-  await saveSessions(context);
+  const permanent = getPermanentOverrides(session);
+  if (permanent.values && Object.prototype.hasOwnProperty.call(permanent.values, key)) {
+    permanent.values[key] = value;
+    await savePermanentOverrides(context, session, permanent);
+  } else {
+    session.customRunsettings.sourcePath = base;
+    session.customRunsettings.overrides[key] = value;
+    await saveSessions(context);
+  }
   await updateContexts();
 }
 
@@ -1305,8 +1602,80 @@ async function resetCustomRunsettingsValue(context: vscode.ExtensionContext, key
   if (!session) {
     return;
   }
-  delete session.customRunsettings.overrides[key];
-  await saveSessions(context);
+  const permanent = getPermanentOverrides(session);
+  let changed = false;
+  if (permanent.values && Object.prototype.hasOwnProperty.call(permanent.values, key)) {
+    delete permanent.values[key];
+    await savePermanentOverrides(context, session, permanent);
+    changed = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(session.customRunsettings.overrides, key)) {
+    delete session.customRunsettings.overrides[key];
+    await saveSessions(context);
+    changed = true;
+  }
+  if (changed) {
+    await updateContexts();
+  }
+}
+
+async function toggleLockCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, isPermanent: boolean): Promise<void> {
+  const session = activeSession();
+  if (!session) {
+    return;
+  }
+  const permanent = getPermanentOverrides(session);
+  permanent.values = permanent.values ?? {};
+  if (isPermanent) {
+    // Currently permanent -> unlock to temporary
+    const currentVal = permanent.values[key] ?? session.customRunsettings.overrides[key];
+    delete permanent.values[key];
+    if (currentVal !== undefined) {
+      session.customRunsettings.overrides[key] = currentVal;
+    }
+    await savePermanentOverrides(context, session, permanent);
+    await saveSessions(context);
+  } else {
+    // Currently temporary -> lock to permanent
+    const currentVal = session.customRunsettings.overrides[key];
+    if (currentVal !== undefined) {
+      permanent.values[key] = currentVal;
+      delete session.customRunsettings.overrides[key];
+      await savePermanentOverrides(context, session, permanent);
+      await saveSessions(context);
+    }
+  }
+  await updateContexts();
+}
+
+async function toggleLockCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, isPermanent: boolean): Promise<void> {
+  const session = activeSession();
+  if (!session) {
+    return;
+  }
+  const permanent = getPermanentOverrides(session);
+  permanent.parameters = permanent.parameters ?? [];
+  if (isPermanent) {
+    // Currently permanent -> unlock
+    const param = permanent.parameters.find(p => p.id === id);
+    permanent.parameters = permanent.parameters.filter(p => p.id !== id);
+    if (param) {
+      if (!session.customRunsettings.parameters.some(p => p.id === id)) {
+        session.customRunsettings.parameters.push({ id: param.id, name: param.name, value: param.value });
+      }
+    }
+    await savePermanentOverrides(context, session, permanent);
+    await saveSessions(context);
+  } else {
+    // Currently temporary -> lock to permanent
+    const param = session.customRunsettings.parameters.find(p => p.id === id);
+    if (param) {
+      session.customRunsettings.parameters = session.customRunsettings.parameters.filter(p => p.id !== id);
+      permanent.parameters.push({ id: param.id, name: param.name, value: param.value });
+      await savePermanentOverrides(context, session, permanent);
+      await saveSessions(context);
+    }
+  }
   await updateContexts();
 }
 
@@ -1331,14 +1700,19 @@ async function addCustomRunsettingsParameter(context: vscode.ExtensionContext): 
 
 async function updateCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, field: 'name' | 'value', value: string): Promise<void> {
   const session = activeSession();
-  const base = session && getOverrideBaseRunsettings(session);
-  const parameter = session?.customRunsettings.parameters.find(item => item.id === id);
+  const base = session && getActiveRunsettings(session);
+  const permanent = getPermanentOverrides(session);
+  const permParam = permanent.parameters?.find(item => item.id === id);
+  const tempParam = session?.customRunsettings.parameters.find(item => item.id === id);
+  const parameter = permParam ?? tempParam;
   if (!session || !base || !parameter) {
     return;
   }
   if (field === 'name') {
     try {
-      const error = validateCustomParameterName(value, (await inspectRunsettings(base, session.customRunsettings)).parameters, session.customRunsettings.parameters, id);
+      const inspected = await inspectRunsettings(base, session.customRunsettings, permanent);
+      const allCustom = inspected.customParameters;
+      const error = validateCustomParameterName(value, inspected.parameters, allCustom, id);
       if (error) {
         vscode.window.showWarningMessage(error);
         return;
@@ -1351,7 +1725,11 @@ async function updateCustomRunsettingsParameter(context: vscode.ExtensionContext
   } else {
     parameter.value = value;
   }
-  await saveSessions(context);
+  if (permParam) {
+    await savePermanentOverrides(context, session, permanent);
+  } else {
+    await saveSessions(context);
+  }
   await updateContexts();
 }
 
@@ -1360,26 +1738,50 @@ async function removeCustomRunsettingsParameter(context: vscode.ExtensionContext
   if (!session) {
     return;
   }
-  session.customRunsettings.parameters = session.customRunsettings.parameters.filter(parameter => parameter.id !== id);
-  await saveSessions(context);
-  await updateContexts();
+  const permanent = getPermanentOverrides(session);
+  let changed = false;
+  if (permanent.parameters?.some(p => p.id === id)) {
+    permanent.parameters = permanent.parameters.filter(p => p.id !== id);
+    await savePermanentOverrides(context, session, permanent);
+    changed = true;
+  }
+  if (session.customRunsettings.parameters.some(p => p.id === id)) {
+    session.customRunsettings.parameters = session.customRunsettings.parameters.filter(parameter => parameter.id !== id);
+    await saveSessions(context);
+    changed = true;
+  }
+  if (changed) {
+    await updateContexts();
+  }
 }
 
 function watchRunsettingsFile(session: SolutionSession): void {
   session.runsettingsWatcher?.close();
+  session.runsettingsWatcher = undefined;
   const file = getActiveRunsettings(session);
   if (!file) {
     return;
   }
-  try {
-    session.runsettingsWatcher = fs.watch(file, () => {
+  session.runsettingsWatcher = watchFileSafely(
+    file,
+    () => {
       if (session.runsettingsReloadTimer) {
         clearTimeout(session.runsettingsReloadTimer);
       }
       session.runsettingsReloadTimer = setTimeout(() => void updateContexts(), 200);
-    });
-  } catch (err) {
-    log(`Could not watch runsettings file: ${err instanceof Error ? err.message : String(err)}`);
+    },
+    () => {
+      if (sessions.get(session.key) === session && getActiveRunsettings(session) === file) {
+        watchRunsettingsFile(session);
+      }
+    }
+  );
+  if (!session.runsettingsWatcher) {
+    setTimeout(() => {
+      if (sessions.get(session.key) === session && getActiveRunsettings(session) === file && !session.runsettingsWatcher) {
+        watchRunsettingsFile(session);
+      }
+    }, 500);
   }
 }
 
@@ -1391,36 +1793,73 @@ async function updateContexts(): Promise<void> {
   await updateViewState();
 }
 
+// Parsing the runsettings XML on every view refresh is wasted work: refreshes
+// fire several times a second during a run. Cache by file identity + overrides.
+const runsettingsViewCache = new Map<string, { signature: string; view: CustomRunsettingsViewState }>();
+let viewStateSequence = 0;
+
+async function inspectRunsettingsCached(
+  session: SolutionSession,
+  base: string,
+  permanent: PermanentRunsettingsConfig
+): Promise<CustomRunsettingsViewState> {
+  let identity = 'missing';
+  try {
+    const stat = await fs.promises.stat(base);
+    identity = `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    // Unreadable: inspectRunsettings reports the error below.
+  }
+  const signature = `${base}|${identity}|${JSON.stringify(session.customRunsettings)}|${JSON.stringify(permanent)}`;
+  const cached = runsettingsViewCache.get(session.key);
+  if (cached && cached.signature === signature) {
+    return cached.view;
+  }
+  const view = await inspectRunsettings(base, session.customRunsettings, permanent);
+  runsettingsViewCache.set(session.key, { signature, view });
+  return view;
+}
+
 async function updateViewState(): Promise<void> {
+  const sequence = ++viewStateSequence;
   const session = activeSession();
   const selectedKey = activeSessionKey;
   let customView: CustomRunsettingsViewState | undefined;
-  if (session?.runsettingsMode === 'override') {
-    const base = getActiveRunsettings(session);
-    if (base) {
-      try {
-        customView = await inspectRunsettings(base, session.customRunsettings);
-      } catch (err) {
-        customView = { available: false, values: [], parameters: [], customParameters: session.customRunsettings.parameters, unresolved: [err instanceof Error ? err.message : String(err)], hasCustomizations: hasCustomRunsettings(session.customRunsettings) };
-      }
+  const base = session && getActiveRunsettings(session);
+  const permanent = getPermanentOverrides(session);
+  if (base) {
+    try {
+      customView = await inspectRunsettingsCached(session, base, permanent);
+    } catch (err) {
+      customView = {
+        available: false,
+        values: [],
+        parameters: [],
+        customParameters: session.customRunsettings.parameters,
+        permanentValues: [],
+        permanentParameters: [],
+        unresolved: [err instanceof Error ? err.message : String(err)],
+        hasCustomizations: hasCustomRunsettings(session.customRunsettings) || hasPermanentRunsettings(permanent)
+      };
     }
   }
   // Inspecting a runsettings file is asynchronous; do not publish stale data
-  // after the user has switched to another solution tab.
-  if (selectedKey !== activeSessionKey) {
+  // after the user has switched to another solution tab, or when a newer
+  // refresh started meanwhile (it will publish fresher state itself).
+  if (selectedKey !== activeSessionKey || sequence !== viewStateSequence) {
     return;
   }
   mainView.setState({
-    sessions: [...sessions.values()].map(item => ({ key: item.key, label: path.basename(item.solutionPath, path.extname(item.solutionPath)), detail: item.solutionPath, ready: item.knownTests !== undefined && item.discoveryCts === undefined, loading: item.discoveryCts !== undefined, testCount: item.knownTests?.size })),
+    sessions: [...sessions.values()].map(item => ({ key: item.key, label: path.basename(item.solutionPath, path.extname(item.solutionPath)), detail: item.solutionPath, ready: item.knownTests !== undefined && item.discoveryCts === undefined, loading: item.discoveryCts !== undefined, testCount: item.knownTests?.size, discoveredCount: item.discoveredCount })),
     activeSessionKey,
     solutionReady: session?.knownTests !== undefined && session.discoveryCts === undefined,
     playlistPath: session?.playlistPath,
     runsettingsPath: session ? getActiveRunsettings(session) : undefined,
-    runsettingsIsDefault: session ? session.runsettingsMode !== 'custom' && getActiveRunsettings(session) !== undefined : false,
-    runsettingsMode: session?.runsettingsMode ?? 'custom',
+    runsettingsIsDefault: session ? session.runsettingsPath === undefined && getActiveRunsettings(session) !== undefined : false,
     defaultRunsettingsAvailable: session ? findDefaultRunsettings(session.solutionPath) !== undefined : false,
-    hasExplicitRunsettings: session?.runsettingsMode === 'custom' && session.runsettingsPath !== undefined,
+    hasExplicitRunsettings: session?.runsettingsPath !== undefined,
     filter: session?.activeFilter?.raw ?? '',
+    visibleTestCount: session ? entriesForSession(session).length : undefined,
     searchAllSolutions,
     resultFilter: session?.testResultFilter ?? createDefaultTestResultFilter(),
     notFoundTests: session?.notFoundTests ?? [],
@@ -1429,6 +1868,27 @@ async function updateViewState(): Promise<void> {
     controlApiEnabled: controlApiSessionEnabled,
     controlApiRunningPort,
     screenshotEmpty: screenshotWouldBeBlank()
+  });
+}
+
+async function navigateToFailureLocation(item: vscode.TestItem | undefined, target: 'callSite' | 'innermostError'): Promise<void> {
+  if (!item) {
+    return;
+  }
+  const locations = failureLocations.get(item.id);
+  const location = target === 'callSite'
+    ? (locations?.callSite ?? locations?.innermostError)
+    : (locations?.innermostError ?? locations?.callSite);
+
+  const finalLoc = location ?? (item.uri && item.range ? new vscode.Location(item.uri, item.range) : undefined);
+  if (!finalLoc) {
+    void vscode.window.showInformationMessage('No failure location available for this test.');
+    return;
+  }
+  const doc = await vscode.workspace.openTextDocument(finalLoc.uri);
+  await vscode.window.showTextDocument(doc, {
+    selection: finalLoc.range,
+    preview: false
   });
 }
 

@@ -13,6 +13,7 @@ export interface SolutionTabState {
   ready: boolean;
   loading: boolean;
   testCount?: number;
+  discoveredCount?: number;
 }
 
 export interface MainViewState {
@@ -23,10 +24,10 @@ export interface MainViewState {
   playlistPath?: string;
   runsettingsPath?: string;
   runsettingsIsDefault: boolean;
-  runsettingsMode: RunsettingsMode;
   defaultRunsettingsAvailable: boolean;
   hasExplicitRunsettings: boolean;
   filter: string;
+  visibleTestCount?: number;
   searchAllSolutions: boolean;
   resultFilter: TestResultFilter;
   skipPreBreakpoint: boolean;
@@ -42,10 +43,9 @@ export interface ScreenshotExportSettings extends ScreenshotOptions {
 }
 
 export type MainViewAction =
-  | { type: 'addSolution' | 'selectPlaylist' | 'clearPlaylist' | 'selectRunsettings' | 'clearRunsettings' | 'openRunsettings' | 'saveAsPlaylist' | 'openScreenshot' | 'closeScreenshot' | 'selectScreenshotSavePath' }
+  | { type: 'addSolution' | 'selectPlaylist' | 'clearPlaylist' | 'selectRunsettings' | 'useDefaultRunsettings' | 'clearRunsettings' | 'openRunsettings' | 'saveAsPlaylist' | 'openScreenshot' | 'closeScreenshot' | 'selectScreenshotSavePath' }
   | { type: 'removeSolution'; key?: string }
   | { type: 'selectSession'; key: string }
-  | { type: 'setRunsettingsMode'; mode: RunsettingsMode }
   | { type: 'filter'; text: string }
   | { type: 'toggleSearchAllSolutions'; checked: boolean }
   | { type: 'clearFilter' }
@@ -54,9 +54,11 @@ export type MainViewAction =
   | { type: 'toggleControlApi'; checked: boolean }
   | { type: 'setCustomRunsettingsValue'; key: string; value: string }
   | { type: 'resetCustomRunsettingsValue'; key: string }
+  | { type: 'toggleLockCustomRunsettingsValue'; key: string; isPermanent: boolean }
   | { type: 'addCustomRunsettingsParameter' }
   | { type: 'updateCustomRunsettingsParameter'; id: string; field: 'name' | 'value'; value: string }
   | { type: 'removeCustomRunsettingsParameter'; id: string }
+  | { type: 'toggleLockCustomRunsettingsParameter'; id: string; isPermanent: boolean }
   | { type: 'requestScreenshotPreview'; settings: ScreenshotExportSettings }
   | { type: 'saveScreenshot'; data: string; savePath?: string };
 
@@ -67,6 +69,7 @@ interface WebviewMessage {
   key?: string;
   value?: string;
   id?: string;
+  isPermanent?: boolean;
   field?: 'name' | 'value';
   mode?: RunsettingsMode;
   resultFilterKey?: TestResultFilterKey;
@@ -83,7 +86,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     solutionReady: false,
     screenshotEmpty: true,
     runsettingsIsDefault: false,
-    runsettingsMode: 'default',
     defaultRunsettingsAvailable: false,
     hasExplicitRunsettings: false,
     filter: '',
@@ -154,7 +156,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
 
   private handleMessage(msg: WebviewMessage): void {
     if (msg.type === 'ready') {
-      this.postState();
+      // A (re)loaded webview has no state yet: bypass the unchanged-state check.
+      this.postState(true);
     } else if (msg.type === 'selectSession' && msg.key !== undefined) {
       this.onAction({ type: 'selectSession', key: msg.key });
     } else if (msg.type === 'removeSolution' && msg.key !== undefined) {
@@ -163,8 +166,6 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.onAction({ type: 'filter', text: msg.text ?? '' });
     } else if (msg.type === 'setResultFilter' && msg.resultFilterKey !== undefined) {
       this.onAction({ type: 'setResultFilter', key: msg.resultFilterKey, checked: msg.checked ?? true });
-    } else if (msg.type === 'setRunsettingsMode' && msg.mode !== undefined) {
-      this.onAction({ type: 'setRunsettingsMode', mode: msg.mode });
     } else if (msg.type === 'toggleSkipPreBreakpoint') {
       this.onAction({ type: 'toggleSkipPreBreakpoint', checked: msg.checked ?? true });
     } else if (msg.type === 'toggleControlApi') {
@@ -175,12 +176,16 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.onAction({ type: 'setCustomRunsettingsValue', key: msg.key, value: msg.value ?? '' });
     } else if (msg.type === 'resetCustomRunsettingsValue' && msg.key !== undefined) {
       this.onAction({ type: 'resetCustomRunsettingsValue', key: msg.key });
+    } else if (msg.type === 'toggleLockCustomRunsettingsValue' && msg.key !== undefined) {
+      this.onAction({ type: 'toggleLockCustomRunsettingsValue', key: msg.key, isPermanent: !!msg.isPermanent });
     } else if (msg.type === 'addCustomRunsettingsParameter') {
       this.onAction({ type: 'addCustomRunsettingsParameter' });
     } else if (msg.type === 'updateCustomRunsettingsParameter' && msg.id !== undefined && msg.field !== undefined) {
       this.onAction({ type: 'updateCustomRunsettingsParameter', id: msg.id, field: msg.field, value: msg.value ?? '' });
     } else if (msg.type === 'removeCustomRunsettingsParameter' && msg.id !== undefined) {
       this.onAction({ type: 'removeCustomRunsettingsParameter', id: msg.id });
+    } else if (msg.type === 'toggleLockCustomRunsettingsParameter' && msg.id !== undefined) {
+      this.onAction({ type: 'toggleLockCustomRunsettingsParameter', id: msg.id, isPermanent: !!msg.isPermanent });
     } else if (msg.type === 'requestScreenshotPreview' && msg.settings !== undefined) {
       this.onAction({ type: 'requestScreenshotPreview', settings: msg.settings });
     } else if (msg.type === 'saveScreenshot' && msg.data !== undefined) {
@@ -190,7 +195,9 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private postState(): void {
+  private lastPostedState: string | undefined;
+
+  private postState(force = false): void {
     const s = this.state;
     const state = {
       type: 'state',
@@ -201,14 +208,14 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       playlistName: s.playlistPath ? path.basename(s.playlistPath) : undefined,
       playlistFull: s.playlistPath,
       runsettingsName: s.runsettingsPath
-        ? path.basename(s.runsettingsPath).replace(/^(.+)\.runsettings$/i, '$1') +
-          (s.runsettingsMode === 'override' ? ' (overridden)' : '')
+        ? path.basename(s.runsettingsPath).replace(/^(.+)\.runsettings$/i, '$1')
         : undefined,
       runsettingsFull: s.runsettingsPath,
-      runsettingsMode: s.runsettingsMode,
+      runsettingsIsDefault: s.runsettingsIsDefault,
       defaultRunsettingsAvailable: s.defaultRunsettingsAvailable,
       hasExplicitRunsettings: s.hasExplicitRunsettings,
       filter: s.filter,
+      visibleTestCount: s.visibleTestCount,
       searchAllSolutions: s.searchAllSolutions,
       resultFilter: s.resultFilter,
       skipPreBreakpoint: s.skipPreBreakpoint,
@@ -217,6 +224,13 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       notFoundTests: s.notFoundTests,
       customRunsettings: s.customRunsettings
     };
+    // State refreshes arrive several times a second during a run but rarely
+    // change anything the webview shows; skip identical payloads.
+    const serialized = JSON.stringify(state);
+    if (!force && serialized === this.lastPostedState) {
+      return;
+    }
+    this.lastPostedState = serialized;
     void this.view?.webview.postMessage(state);
     void this.screenshotPanel?.webview.postMessage(state);
   }
@@ -352,17 +366,9 @@ function renderHtml(screenshotOnly = false): string {
   button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
   button.solid:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
   button:disabled { opacity: 0.5; cursor: default; }
-  select#runsettingsMode {
-    background: var(--vscode-dropdown-background);
-    color: var(--vscode-dropdown-foreground);
-    border: 0;
-    font-family: inherit;
-    font-size: inherit;
-    padding: 2px 4px;
-  }
-  select#runsettingsMode:disabled { opacity: 0.5; }
-  #selectRunsettings { align-self: flex-start; }
-  #customRunsettingsSection { padding: 4px; }
+  #selectRunsettings, #useDefaultRunsettings { align-self: flex-start; }
+  .runsettings-buttons { display: flex; flex-direction: row; gap: 6px; }
+  #permanentRunsettingsSection, #customRunsettingsSection { padding: 4px; }
   .section { padding: 2px 8px; }
   .row { display: flex; flex-direction: row; gap: 6px; align-items: center; min-height: 32px; }
   .row[hidden] { display: none; }
@@ -435,12 +441,15 @@ function renderHtml(screenshotOnly = false): string {
   .custom-content { padding-top: 6px; display: flex; flex-direction: column; gap: 5px; }
   .custom-group { display: flex; flex-direction: column; gap: 4px; }
   .custom-group-title { font-weight: 600; margin-top: 4px; }
-  .custom-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 4px; align-items: center; }
+  .custom-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto auto; gap: 4px; align-items: center; }
   .custom-row .path, .custom-row .parameter-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .custom-row input { min-width: 0; width: auto; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); padding: 3px 5px; font-family: inherit; font-size: inherit; }
   .custom-row input:focus { outline: 1px solid var(--vscode-focusBorder); }
   .custom-row input[readonly] { opacity: 0.75; }
-  .custom-row button { padding-left: 5px; padding-right: 5px; }
+  .custom-row button { padding-left: 3px; padding-right: 3px; }
+  .lock-button { opacity: 0.6; }
+  .lock-button.locked { opacity: 1; color: var(--vscode-charts-yellow, #cca700); }
+  .lock-button:hover:not(:disabled) { opacity: 1; }
   .custom-label { opacity: 0.7; font-size: 0.9em; }
   .custom-warning { color: var(--vscode-editorWarning-foreground); overflow-wrap: anywhere; }
   .custom-empty { opacity: 0.7; font-style: italic; }
@@ -525,14 +534,19 @@ function renderHtml(screenshotOnly = false): string {
     <div class="section runsettings-zone">
       <div class="runsettings-section row">
         <span class="label">Runsettings</span>
-        <select id="runsettingsMode" title="Default: use the .runsettings next to the solution. Override: edit the default file's values (stored separately). Custom: pick another .runsettings file (no overrides).">
-          <option value="default">Default</option>
-          <option value="override">Override</option>
-          <option value="custom">Custom</option>
-        </select>
         <span class="name empty" id="runsettingsName">None</span>
       </div>
-      <button class="solid" id="selectRunsettings" title="Select Runsettings File..." hidden>Select Runsettings File...</button>
+      <div class="runsettings-buttons">
+        <button class="solid" id="selectRunsettings" title="Select Runsettings File">Select Runsettings File</button>
+        <button class="solid" id="useDefaultRunsettings" title="Use the default .runsettings file next to the solution">Use Default File</button>
+      </div>
+      <details id="permanentRunsettingsSection" hidden>
+        <summary>Permanent overrides</summary>
+        <div class="custom-content">
+          <div class="custom-label" id="permanentRunsettingsHint">Overrides stored per solution and preserved across files.</div>
+          <div id="permanentRunsettingsGroups"></div>
+        </div>
+      </details>
       <details id="customRunsettingsSection" hidden>
         <summary>Custom runsettings</summary>
         <div class="custom-content">
@@ -614,7 +628,10 @@ function renderHtml(screenshotOnly = false): string {
        tab.title = session.detail + (session.loading ? ' (loading)' : session.ready ? ' (ready)' : '');
        const select = document.createElement('button');
        select.className = 'solution-tab-select';
-       select.textContent = session.label + (session.loading ? ' (...)' : session.testCount !== undefined ? ' (' + session.testCount + ')' : '');
+       const countSuffix = session.loading
+         ? (session.discoveredCount ? ' (' + session.discoveredCount + ' found...)' : ' (...)')
+         : (session.testCount !== undefined ? ' (' + session.testCount + ')' : '');
+       select.textContent = session.label + countSuffix;
        select.title = tab.title;
        select.addEventListener('click', () => vscode.postMessage({ type: 'selectSession', key: session.key }));
         const close = document.createElement('button');
@@ -632,7 +649,7 @@ function renderHtml(screenshotOnly = false): string {
   }
 
   function updateSaveAsPlaylist() {
-    $('saveAsPlaylist').disabled = input.value.trim().length === 0;
+    $('saveAsPlaylist').disabled = latestVisibleTestCount === 0;
   }
 
   let debounce;
@@ -732,6 +749,7 @@ function renderHtml(screenshotOnly = false): string {
       }
     });
     let latestSessions = [];
+    let latestVisibleTestCount = 0;
     let screenshotPreviewUrl;
     let screenshotPng;
     let screenshotPreviewRequest = 0;
@@ -1105,8 +1123,7 @@ function renderHtml(screenshotOnly = false): string {
   $('selectPlaylist').addEventListener('click', () => vscode.postMessage({ type: 'selectPlaylist' }));
   $('clearPlaylist').addEventListener('click', () => vscode.postMessage({ type: 'clearPlaylist' }));
   $('selectRunsettings').addEventListener('click', () => vscode.postMessage({ type: 'selectRunsettings' }));
-  $('runsettingsMode').addEventListener('change', e =>
-    vscode.postMessage({ type: 'setRunsettingsMode', mode: e.target.value }));
+  $('useDefaultRunsettings').addEventListener('click', () => vscode.postMessage({ type: 'useDefaultRunsettings' }));
   $('addCustomParameter').addEventListener('click', () => vscode.postMessage({ type: 'addCustomRunsettingsParameter' }));
   $('skipPreBreakpoint').addEventListener('change', e =>
     vscode.postMessage({ type: 'toggleSkipPreBreakpoint', checked: e.target.checked }));
@@ -1118,11 +1135,24 @@ function renderHtml(screenshotOnly = false): string {
   const customDebounces = {};
   const pendingCustomValues = Object.create(null);
   let latestCustomRunsettings;
-  let latestRunsettingsMode = 'custom';
   let deferredCustomRender = false;
+  let inputBlurGuard = false;
   function postCustomChange(message, debounceKey) {
     clearTimeout(customDebounces[debounceKey]);
-    customDebounces[debounceKey] = setTimeout(() => vscode.postMessage(message), 250);
+    customDebounces[debounceKey] = { timer: setTimeout(() => {
+      delete customDebounces[debounceKey];
+      vscode.postMessage(message);
+    }, 250), message };
+  }
+
+  function flushCustomChange(debounceKey) {
+    const pending = customDebounces[debounceKey];
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    delete customDebounces[debounceKey];
+    vscode.postMessage(pending.message);
   }
 
   function isEditingCustomRunsettings() {
@@ -1182,24 +1212,50 @@ function renderHtml(screenshotOnly = false): string {
         onInput(input.value);
       });
       input.addEventListener('blur', () => setTimeout(() => {
-        if (deferredCustomRender && !isEditingCustomRunsettings()) {
-          deferredCustomRender = false;
-          renderCustomRunsettings(latestCustomRunsettings, latestRunsettingsMode);
+        if (!deferredCustomRender || isEditingCustomRunsettings() || inputBlurGuard) {
+          return;
         }
+        deferredCustomRender = false;
+        renderCustomRunsettings(latestCustomRunsettings);
       }, 0));
     }
     return input;
   }
 
-  function createResetButton(key, overridden) {
+  function createLockButton(isPermanent, key, onToggle) {
     const button = document.createElement('button');
-    button.textContent = 'Reset';
+    button.className = 'icon-button lock-button' + (isPermanent ? ' locked' : '');
+    const lockedPath = 'M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-.5V4.5A3.5 3.5 0 0 0 8 1zm2 5H6V4.5a2 2 0 1 1 4 0V6z';
+    const unlockedPath = 'M8 1a3.5 3.5 0 0 0-3.5 3.5h1.5A2 2 0 0 1 8 2.5a2 2 0 0 1 2 2V6H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-.5V4.5A3.5 3.5 0 0 0 8 1z';
+    button.appendChild(createIcon(isPermanent ? lockedPath : unlockedPath));
+    button.title = isPermanent ? 'Permanent override (preserved across files). Click to make temporary.' : 'Temporary override. Click to make permanent (lock).';
+    button.setAttribute('aria-label', isPermanent ? 'Permanent override' : 'Temporary override');
+    button.addEventListener('mousedown', () => {
+      // Flush the pending debounced save so the extension has the current
+      // value before locking/unlocking, and suppress the blur-triggered
+      // re-render: it would replace this button between mousedown and
+      // click, swallowing the click entirely.
+      flushCustomChange(key);
+      inputBlurGuard = true;
+      setTimeout(() => { inputBlurGuard = false; }, 0);
+    });
+    button.addEventListener('click', onToggle);
+    return button;
+  }
+
+  function createResetButton(key, overridden, onReset) {
+    const button = document.createElement('button');
+    button.className = 'icon-button';
+    button.appendChild(createIcon('M13 8c0-2.761-2.239-5-5-5-1.635 0-3.088.785-4 2h2c.276 0 .5.224.5.5s-.224.5-.5.5H3.109A.2.2 0 0 1 3 6c-.276 0-.5-.224-.5-.5V2.5c0-.276.224-.5.5-.5s.5.224.5.5v1.531C4.599 2.786 6.207 2 8 2c3.314 0 6 2.686 6 6 0 3.314-2.686 6-6 6-3.13 0-5.7-2.397-5.976-5.455a.502.502 0 0 1 .453-.543.502.502 0 0 1 .543.453C3.25 11.003 5.392 13 8 13c2.761 0 5-2.239 5-5z'));
     button.disabled = !overridden;
     button.title = 'Use the value from the base runsettings file';
-    button.addEventListener('click', () => {
-      delete pendingCustomValues[key];
-      vscode.postMessage({ type: 'resetCustomRunsettingsValue', key });
+    button.setAttribute('aria-label', 'Reset to base runsettings value');
+    button.addEventListener('mousedown', () => {
+      flushCustomChange(key);
+      inputBlurGuard = true;
+      setTimeout(() => { inputBlurGuard = false; }, 0);
     });
+    button.addEventListener('click', onReset);
     return button;
   }
 
@@ -1213,7 +1269,13 @@ function renderHtml(screenshotOnly = false): string {
     row.appendChild(label);
     row.appendChild(createCustomInput(item.value, item.key, value =>
       postCustomChange({ type: 'setCustomRunsettingsValue', key: item.key, value }, item.key), false));
-    row.appendChild(createResetButton(item.key, !!item.overridden));
+    row.appendChild(createLockButton(!!item.isPermanent, item.key, () => {
+      vscode.postMessage({ type: 'toggleLockCustomRunsettingsValue', key: item.key, isPermanent: !!item.isPermanent });
+    }));
+    row.appendChild(createResetButton(item.key, !!item.overridden, () => {
+      delete pendingCustomValues[item.key];
+      vscode.postMessage({ type: 'resetCustomRunsettingsValue', key: item.key });
+    }));
     return row;
   }
 
@@ -1228,6 +1290,11 @@ function renderHtml(screenshotOnly = false): string {
       postCustomChange({ type: 'updateCustomRunsettingsParameter', id: item.id, field: 'value', value: nextValue }, item.id + ':value'), false);
     value.placeholder = 'Value';
     row.appendChild(value);
+    row.appendChild(createLockButton(!!item.isPermanent, item.id + ':value', () => {
+      flushCustomChange(item.id + ':name');
+      flushCustomChange(item.id + ':value');
+      vscode.postMessage({ type: 'toggleLockCustomRunsettingsParameter', id: item.id, isPermanent: !!item.isPermanent });
+    }));
     const remove = document.createElement('button');
     remove.textContent = 'Remove';
     remove.title = 'Remove custom parameter';
@@ -1240,7 +1307,7 @@ function renderHtml(screenshotOnly = false): string {
     return row;
   }
 
-  function createCustomGroup(section) {
+  function createCustomGroup(section, containerId = 'customRunsettingsGroups') {
     const group = document.createElement('div');
     group.className = 'custom-group';
     const title = document.createElement('div');
@@ -1249,25 +1316,61 @@ function renderHtml(screenshotOnly = false): string {
     group.appendChild(title);
     const rows = document.createElement('div');
     group.appendChild(rows);
-    $('customRunsettingsGroups').appendChild(group);
+    $(containerId).appendChild(group);
     return rows;
   }
 
-  function renderCustomRunsettings(custom, mode) {
+  function renderPermanentRunsettings(custom) {
+    const section = $('permanentRunsettingsSection');
+    const groups = $('permanentRunsettingsGroups');
+    groups.replaceChildren();
+
+    const permValues = custom?.permanentValues || [];
+    const permParams = custom?.permanentParameters || [];
+
+    if (permValues.length === 0 && permParams.length === 0) {
+      section.hidden = true;
+      return;
+    }
+    section.hidden = false;
+
+    const groupRows = Object.create(null);
+    function rowsFor(sectionName) {
+      if (!groupRows[sectionName]) {
+        groupRows[sectionName] = createCustomGroup(sectionName, 'permanentRunsettingsGroups');
+      }
+      return groupRows[sectionName];
+    }
+
+    permParams.forEach(item => {
+      if ('id' in item) {
+        rowsFor('TestRunParameters').appendChild(createCustomParameterRow(item));
+      } else {
+        rowsFor('TestRunParameters').appendChild(createValueRow(item, true));
+      }
+    });
+
+    permValues.forEach(item => {
+      rowsFor(item.section).appendChild(createValueRow(item, false));
+    });
+  }
+
+  function renderCustomRunsettings(custom) {
     latestCustomRunsettings = custom;
-    latestRunsettingsMode = mode;
     reconcilePendingCustomValues(custom);
-    // Extension state is persisted asynchronously. Do not replace this editor
-    // with an older state echo while a user is typing in one of its fields.
+
+    // Extension state is persisted asynchronously. Do not replace either
+    // editor (temporary or permanent overrides) with an older state echo
+    // while a user is typing in one of its fields.
     if (isEditingCustomRunsettings()) {
       deferredCustomRender = true;
       return;
     }
     deferredCustomRender = false;
+    renderPermanentRunsettings(custom);
+
     const section = $('customRunsettingsSection');
-    // The override editor only exists in Override mode: Default uses the file
-    // as-is and Custom files can never be overridden.
-    if (mode !== 'override') {
+    if (!custom || !custom.available) {
       section.hidden = true;
       return;
     }
@@ -1290,7 +1393,7 @@ function renderHtml(screenshotOnly = false): string {
     const groupRows = Object.create(null);
     function rowsFor(sectionName) {
       if (!groupRows[sectionName]) {
-        groupRows[sectionName] = createCustomGroup(sectionName);
+        groupRows[sectionName] = createCustomGroup(sectionName, 'customRunsettingsGroups');
       }
       return groupRows[sectionName];
     }
@@ -1328,6 +1431,7 @@ function renderHtml(screenshotOnly = false): string {
     const sessionSwitched = previousActiveSessionKey !== undefined && previousActiveSessionKey !== s.activeSessionKey;
     previousActiveSessionKey = s.activeSessionKey;
     latestSessions = s.sessions || [];
+    latestVisibleTestCount = s.visibleTestCount ?? 0;
     renderSessions(s.sessions, s.activeSessionKey);
     if (sessionSwitched) {
       userEditedFilter = false;
@@ -1347,21 +1451,16 @@ function renderHtml(screenshotOnly = false): string {
     setName($('playlistName'), s.playlistName, 'No playlist selected', s.playlistFull);
     setName($('runsettingsName'), s.runsettingsName, 'None', s.runsettingsFull);
     const runsettingsNameEl = $('runsettingsName');
-    if (s.runsettingsFull && (s.runsettingsMode === 'default' || s.runsettingsMode === 'custom')) {
+    if (s.runsettingsFull) {
       runsettingsNameEl.classList.add('clickable');
       runsettingsNameEl.title = 'Click to open file in editor';
     } else {
       runsettingsNameEl.classList.remove('clickable');
     }
-    const modeSelect = $('runsettingsMode');
-    modeSelect.value = s.runsettingsMode ?? 'custom';
-    modeSelect.disabled = !s.solutionReady;
-    modeSelect.querySelector('option[value="default"]').disabled = !s.defaultRunsettingsAvailable;
-    modeSelect.querySelector('option[value="override"]').disabled = !s.defaultRunsettingsAvailable;
     $('selectPlaylist').disabled = !s.solutionReady;
     $('clearPlaylist').disabled = !s.playlistName;
-    $('selectRunsettings').hidden = s.runsettingsMode !== 'custom';
     $('selectRunsettings').disabled = !s.solutionReady;
+    $('useDefaultRunsettings').disabled = !s.solutionReady || !s.defaultRunsettingsAvailable || !!s.runsettingsIsDefault;
     $('skipPreBreakpoint').checked = !!s.skipPreBreakpoint;
     $('controlApiEnabled').checked = !!s.controlApiEnabled;
     if (s.controlApiEnabled && s.controlApiRunningPort) {
@@ -1379,7 +1478,7 @@ function renderHtml(screenshotOnly = false): string {
        openScreenshotModal();
      }
     setNotFoundTests(s.notFoundTests);
-    renderCustomRunsettings(s.customRunsettings, s.runsettingsMode);
+    renderCustomRunsettings(s.customRunsettings);
   });
 
   vscode.postMessage({ type: 'ready' });

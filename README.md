@@ -13,6 +13,9 @@ You can use .NET Testing+ alongside the official C# Dev Kit extension, but they 
 - Run and debug tests from multiple .NET solutions in one Test Results run.
 - Filter tests according to a playlist file or advanced queries.
 - Use custom runsettings files.
+- Run Test / Debug Test CodeLens links above test methods in the editor.
+- Collect code coverage (XPlat Code Coverage) via the "Run with Coverage" profile in the Test Explorer.
+- Load `.sln`, `.slnf` (solution filter), and `.slnx` solutions.
 
 ## Getting Started
 
@@ -34,12 +37,7 @@ This view includes the following options:
   - **Save As Playlist**: saves the currently visible tests in the Test Explorer in a .playlist file. Useful for keeping track, saving, and sharing test runs.
 - **Solution Manager**: load one or more .NET Solutions and run its tests. Tests from multiple solutions can be executed in the same test run. Each solution has its own settings:
     - **Playlist**: select a .playlist file, following the Visual Studio syntax, and filter the tests according to it.
-    - **Runsettings**: choose how the selected solution's .runsettings file is picked via a dropdown with three modes.
-        - **Default** uses the .runsettings file in the solution directory as-is. 
-        - **Override** uses that same default file as a base, but lets you override its values and add more parameters.
-        - **Custom** lets you select any other .runsettings file, used as-is (no overrides). 
-    
-        If no default .runsettings file exists in the solution directory, only Custom is available.
+    - **Runsettings**: by default, the default `.runsettings` file next to the solution is loaded. You can select any custom `.runsettings` file with "Select Runsettings File", or revert to the default file with "Use Default File". Overrides are always active and solution-specific: when switching runsettings files or loading a solution, permanent overrides remain while non-permanent overrides update to the file's values.
     - **Skip pre-breakpoint**: since this extension is not tightly integrated with VS Code, it uses the `dotnet` command to debug tests. This command creates an initial breakpoint when debugging tests, before the test starts executing. This option, enabled by default, skips that breakpoint. There should be no reason to disable it, but it's left as a choice.
 
 ## Contact
