@@ -7,6 +7,7 @@ export interface RunsettingsValue {
   label: string;
   value: string;
   overridden: boolean;
+  isPermanent?: boolean;
 }
 
 export interface BaseRunsettingsParameter {
@@ -14,12 +15,19 @@ export interface BaseRunsettingsParameter {
   name: string;
   value: string;
   overridden?: boolean;
+  isPermanent?: boolean;
 }
 
 export interface CustomRunsettingsParameter {
   id: string;
   name: string;
   value: string;
+  isPermanent?: boolean;
+}
+
+export interface PermanentRunsettingsConfig {
+  values?: Record<string, string>;
+  parameters?: CustomRunsettingsParameter[];
 }
 
 export interface CustomRunsettingsState {
@@ -33,6 +41,8 @@ export interface CustomRunsettingsViewState {
   values: RunsettingsValue[];
   parameters: BaseRunsettingsParameter[];
   customParameters: CustomRunsettingsParameter[];
+  permanentValues?: RunsettingsValue[];
+  permanentParameters?: (BaseRunsettingsParameter | CustomRunsettingsParameter)[];
   unresolved: string[];
   hasCustomizations: boolean;
 }
@@ -93,6 +103,39 @@ export function createCustomRunsettingsState(): CustomRunsettingsState {
   return { overrides: {}, parameters: [] };
 }
 
+export function normalizePermanentRunsettingsConfig(value: unknown): PermanentRunsettingsConfig {
+  const raw = value as Partial<PermanentRunsettingsConfig> | undefined;
+  const values: Record<string, string> = {};
+  if (raw?.values && typeof raw.values === 'object') {
+    Object.entries(raw.values).forEach(([key, val]) => {
+      if (typeof val === 'string') {
+        values[key] = val;
+      }
+    });
+  }
+  const parameters = Array.isArray(raw?.parameters)
+    ? raw.parameters.flatMap(parameter => {
+      if (!parameter || typeof parameter !== 'object') {
+        return [];
+      }
+      const item = parameter as Partial<CustomRunsettingsParameter>;
+      if (typeof item.id !== 'string' || typeof item.name !== 'string' || typeof item.value !== 'string') {
+        return [];
+      }
+      return [{ id: item.id, name: item.name, value: item.value, isPermanent: true }];
+    })
+    : [];
+  return { values, parameters };
+}
+
+export function hasPermanentRunsettings(config: PermanentRunsettingsConfig | undefined): boolean {
+  if (!config) {
+    return false;
+  }
+  return (config.values !== undefined && Object.keys(config.values).length > 0) ||
+    (config.parameters !== undefined && config.parameters.length > 0);
+}
+
 export function hasCustomRunsettings(state: CustomRunsettingsState | undefined): boolean {
   return state !== undefined &&
     (Object.keys(state.overrides).length > 0 || state.parameters.length > 0);
@@ -151,36 +194,79 @@ export function validateCustomParameterName(
 
 export async function inspectRunsettings(
   basePath: string,
-  state: CustomRunsettingsState | undefined
+  state: CustomRunsettingsState | undefined,
+  permanentConfig?: PermanentRunsettingsConfig
 ): Promise<CustomRunsettingsViewState> {
   const normalized = normalizeCustomRunsettingsState(state);
+  const normalizedPermanent = normalizePermanentRunsettingsConfig(permanentConfig);
   const parsed = parseRunsettingsXml(await fs.promises.readFile(basePath, 'utf8'));
   const knownKeys = new Set<string>();
+
+  const permanentValuesRecord = normalizedPermanent.values ?? {};
+  const permanentParametersList = normalizedPermanent.parameters ?? [];
+
   const values = parsed.values.map(value => {
     knownKeys.add(value.key);
+    const hasPerm = hasOwn(permanentValuesRecord, value.key);
+    const hasTemp = hasOwn(normalized.overrides, value.key);
+    const activeValue = hasTemp ? normalized.overrides[value.key] : (hasPerm ? permanentValuesRecord[value.key] : value.value);
     return {
       key: value.key,
       section: value.section,
       label: value.label,
-      value: hasOwn(normalized.overrides, value.key) ? normalized.overrides[value.key] : value.value,
-      overridden: hasOwn(normalized.overrides, value.key)
+      value: activeValue,
+      overridden: hasTemp || hasPerm,
+      isPermanent: hasPerm
     };
   });
+
   const parameters = parsed.parameters.map(parameter => {
     knownKeys.add(parameter.key);
+    const hasPerm = hasOwn(permanentValuesRecord, parameter.key);
+    const hasTemp = hasOwn(normalized.overrides, parameter.key);
+    const activeValue = hasTemp ? normalized.overrides[parameter.key] : (hasPerm ? permanentValuesRecord[parameter.key] : parameter.value);
     return {
       key: parameter.key,
       name: parameter.name,
-      value: hasOwn(normalized.overrides, parameter.key) ? normalized.overrides[parameter.key] : parameter.value,
-      overridden: hasOwn(normalized.overrides, parameter.key)
+      value: activeValue,
+      overridden: hasTemp || hasPerm,
+      isPermanent: hasPerm
     };
   });
-  const unresolved = Object.keys(normalized.overrides)
+
+  const allOverrides = { ...permanentValuesRecord, ...normalized.overrides };
+  const unresolved = Object.keys(allOverrides)
     .filter(key => !knownKeys.has(key))
     .map(key => `Setting no longer exists: ${key}`);
+
   const baseNames = new Set(parameters.map(parameter => parameter.name.trim().toLowerCase()));
   const customNames = new Set<string>();
+
+  // Tag custom parameters from state (temporary unless matching permanent)
+  const permanentParamIds = new Set(permanentParametersList.map(p => p.id));
+
+  const customParameters: CustomRunsettingsParameter[] = [];
+
+  // Add temporary parameters
   normalized.parameters.forEach(parameter => {
+    const isPerm = permanentParamIds.has(parameter.id);
+    customParameters.push({
+      ...parameter,
+      isPermanent: isPerm
+    });
+  });
+
+  // Also include any permanent custom parameters not already in normalized.parameters
+  permanentParametersList.forEach(permParam => {
+    if (!customParameters.some(p => p.id === permParam.id || p.name.trim().toLowerCase() === permParam.name.trim().toLowerCase())) {
+      customParameters.push({
+        ...permParam,
+        isPermanent: true
+      });
+    }
+  });
+
+  customParameters.forEach(parameter => {
     const normalizedName = parameter.name.trim().toLowerCase();
     if (!normalizedName) {
       unresolved.push(`Custom parameter "${parameter.id}" has a blank name.`);
@@ -193,52 +279,77 @@ export async function inspectRunsettings(
     }
   });
 
+  // Collect permanent values & parameters for dedicated section
+  const permanentValues = values.filter(v => v.isPermanent);
+  const permanentBaseParams = parameters.filter(p => p.isPermanent);
+  const permanentCustomParams = customParameters.filter(p => p.isPermanent);
+  const permanentParameters = [...permanentBaseParams, ...permanentCustomParams];
+
   return {
     available: true,
     values,
     parameters,
-    customParameters: normalized.parameters,
+    customParameters,
+    permanentValues,
+    permanentParameters,
     unresolved,
-    hasCustomizations: hasCustomRunsettings(normalized)
+    hasCustomizations: hasCustomRunsettings(normalized) || hasPermanentRunsettings(normalizedPermanent)
   };
 }
 
 export async function materializeRunsettings(
   basePath: string,
   state: CustomRunsettingsState,
-  storageDirectory: string
+  storageDirectory: string,
+  permanentConfig?: PermanentRunsettingsConfig
 ): Promise<{ path: string; unresolved: string[] }> {
   const parsed = parseRunsettingsXml(await fs.promises.readFile(basePath, 'utf8'));
   const knownKeys = new Set<string>();
   parsed.values.forEach(value => knownKeys.add(value.key));
   parsed.parameters.forEach(parameter => knownKeys.add(parameter.key));
+
+  const normalizedPermanent = normalizePermanentRunsettingsConfig(permanentConfig);
+  const mergedOverrides: Record<string, string> = {
+    ...(normalizedPermanent.values ?? {}),
+    ...state.overrides
+  };
+
   const replacements: Replacement[] = [];
   parsed.values.forEach(value => {
-    if (hasOwn(state.overrides, value.key)) {
+    if (hasOwn(mergedOverrides, value.key)) {
       replacements.push({
         start: value.start,
         end: value.end,
-        value: value.prefix + encodeXml(state.overrides[value.key]) + value.suffix
+        value: value.prefix + encodeXml(mergedOverrides[value.key]) + value.suffix
       });
     }
   });
   parsed.parameters.forEach(parameter => {
-    if (hasOwn(state.overrides, parameter.key)) {
+    if (hasOwn(mergedOverrides, parameter.key)) {
       replacements.push({
         start: parameter.start,
         end: parameter.end,
-        value: encodeXml(state.overrides[parameter.key])
+        value: encodeXml(mergedOverrides[parameter.key])
       });
     }
   });
 
-  const unresolved = Object.keys(state.overrides)
+  const unresolved = Object.keys(mergedOverrides)
     .filter(key => !knownKeys.has(key))
     .map(key => `Setting no longer exists: ${key}`);
+
   const baseNames = new Set(parsed.parameters.map(parameter => parameter.name.trim().toLowerCase()));
   const customNames = new Set<string>();
   const validParameters: CustomRunsettingsParameter[] = [];
-  state.parameters.forEach(parameter => {
+
+  const combinedCustomParameters: CustomRunsettingsParameter[] = [...state.parameters];
+  (normalizedPermanent.parameters ?? []).forEach(permParam => {
+    if (!combinedCustomParameters.some(p => p.id === permParam.id || p.name.trim().toLowerCase() === permParam.name.trim().toLowerCase())) {
+      combinedCustomParameters.push(permParam);
+    }
+  });
+
+  combinedCustomParameters.forEach(parameter => {
     const normalizedName = parameter.name.trim().toLowerCase();
     if (!normalizedName) {
       unresolved.push(`Custom parameter "${parameter.id}" has a blank name.`);
