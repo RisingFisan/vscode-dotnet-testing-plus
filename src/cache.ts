@@ -1,10 +1,24 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { writeFileAtomic } from './fileScanCache';
 
 interface CacheEntry {
   slnMtimeMs: number;
   projectMtimes: Record<string, number>;
   tests: string[];
+  /**
+   * Scanner implementation/version that produced `tests` ('ast-1' or
+   * 'regex-1'). Entries written by older releases have none, which never
+   * matches a current version, so they are treated as stale once.
+   */
+  parserVersion?: string;
+  /**
+   * Digest of the FQNs the source scan found when 	ests was cached. A source
+   * edit that adds/removes/renames a test changes it without touching any
+   * .sln/.csproj mtime, so it invalidates the entry. Absent on older entries
+   * (treated as stale once).
+   */
+  scanFingerprint?: string;
 }
 
 type CacheData = Record<string, CacheEntry>;
@@ -24,18 +38,23 @@ export class SolutionCache {
   constructor(storageDir: string) {
     this.file = path.join(storageDir, 'solution-cache.json');
     try {
-      this.data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      this.data = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch {
       this.data = {};
     }
   }
 
-  get(slnPath: string, projectPaths: string[]): string[] | undefined {
+  get(slnPath: string, projectPaths: string[], parserVersion: string | undefined, scanFingerprint?: string): string[] | undefined {
     const entry = this.data[slnPath];
     if (!entry) {
       return undefined;
     }
-    if (mtimeOf(slnPath) !== entry.slnMtimeMs) {
+    if (
+      mtimeOf(slnPath) !== entry.slnMtimeMs ||
+      entry.parserVersion !== parserVersion ||
+      entry.scanFingerprint !== scanFingerprint
+    ) {
       return undefined;
     }
     for (const project of projectPaths) {
@@ -46,7 +65,7 @@ export class SolutionCache {
     return entry.tests;
   }
 
-  set(slnPath: string, projectPaths: string[], tests: string[]): void {
+  set(slnPath: string, projectPaths: string[], tests: string[], parserVersion: string | undefined, scanFingerprint?: string): void {
     const slnMtimeMs = mtimeOf(slnPath);
     if (slnMtimeMs === undefined) {
       return;
@@ -58,7 +77,7 @@ export class SolutionCache {
         projectMtimes[project] = mtime;
       }
     }
-    this.data[slnPath] = { slnMtimeMs, projectMtimes, tests };
+    this.data[slnPath] = { slnMtimeMs, projectMtimes, tests, parserVersion, scanFingerprint };
   }
 
   invalidate(slnPath: string): void {
@@ -67,8 +86,7 @@ export class SolutionCache {
 
   save(): void {
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify(this.data));
+      writeFileAtomic(this.file, JSON.stringify(this.data));
     } catch {
       // Caching is best-effort.
     }

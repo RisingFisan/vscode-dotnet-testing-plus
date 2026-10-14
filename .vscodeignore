@@ -10,4 +10,10 @@ tsconfig.json
 package-lock.json
 .env
 
+# web-tree-sitter runtime: the scanner loads WASM strictly from assets/wasm/,
+# so the package's own copies and debug builds are dead weight in the VSIX.
+node_modules/web-tree-sitter/debug/**
+node_modules/web-tree-sitter/*.wasm.map
+node_modules/web-tree-sitter/web-tree-sitter.wasm
+
 dummy-mes/**
