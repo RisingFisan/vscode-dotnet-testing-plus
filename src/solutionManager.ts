@@ -42,12 +42,26 @@ export async function pickSolutionInteractively(): Promise<string | undefined> {
     return uris?.[0]?.fsPath;
   }
 
+  // Sort solutions alphabetically by relative path (or fsPath if outside workspace)
+  const items = solutions
+    .map(u => {
+      const relPath = vscode.workspace.asRelativePath(u, false);
+      return {
+        label: path.basename(u.fsPath),
+        description: relPath !== path.basename(u.fsPath) ? path.dirname(relPath) : '',
+        detail: relPath,
+        fsPath: u.fsPath
+      };
+    })
+    .sort((a, b) => a.detail.localeCompare(b.detail, undefined, { sensitivity: 'base', numeric: true }));
+
   const picked = await vscode.window.showQuickPick(
-    solutions.map(u => ({
-      label: path.basename(u.fsPath),
-      detail: u.fsPath
-    })),
-    { placeHolder: 'Select the solution (.sln) to discover tests from' }
+    items,
+    {
+      placeHolder: 'Select the solution (.sln) to discover tests from',
+      matchOnDescription: true,
+      matchOnDetail: true
+    }
   );
-  return picked?.detail;
+  return picked?.fsPath;
 }
