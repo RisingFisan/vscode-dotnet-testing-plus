@@ -6,6 +6,7 @@ logger/obj/
 .opencode/
 opencode.json
 .env
+.vscode/settings.json
 
 # Local dummy MES-like solution used to manually test the extension
 dummy-mes/**/bin/
