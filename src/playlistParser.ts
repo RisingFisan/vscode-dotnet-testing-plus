@@ -1,5 +1,6 @@
 import * as path from 'path';
 import { XMLParser } from 'fast-xml-parser';
+import { compareText } from './collation';
 
 export interface PlaylistTest {
   project?: string;
@@ -130,16 +131,17 @@ export function expandPlaylist(
   knownTests: ReadonlySet<string>,
   projectFor?: (fqn: string) => string | undefined
 ): { entries: PlaylistTest[]; notFound: string[] } {
+  const index = new KnownTestIndex(knownTests);
   const excluded = new Set<string>();
   for (const entry of playlist.excludes) {
-    for (const fqn of matchKnownTests(entry.fullyQualifiedName, knownTests)) {
+    for (const fqn of matchKnownTests(entry.fullyQualifiedName, index)) {
       excluded.add(fqn);
     }
   }
   const entries: PlaylistTest[] = [];
   const notFound: string[] = [];
   for (const entry of playlist.includes) {
-    const matches = matchKnownTests(entry.fullyQualifiedName, knownTests);
+    const matches = matchKnownTests(entry.fullyQualifiedName, index);
     if (matches.length === 0) {
       notFound.push(entry.fullyQualifiedName);
       continue;
@@ -162,24 +164,59 @@ export function entryFromKnownTestFqn(fqn: string, projectPath?: string): Playli
   return entry;
 }
 
-function matchKnownTests(prefix: string, knownTests: ReadonlySet<string>): string[] {
-  if (knownTests.has(prefix)) {
-    return [prefix];
+/**
+ * Known test FQNs sorted once so prefix lookups (the common playlist entry: a
+ * whole class or namespace) are a binary search plus a contiguous walk instead
+ * of a scan over every known test per playlist entry.
+ */
+class KnownTestIndex {
+  readonly known: ReadonlySet<string>;
+  readonly sorted: string[];
+  private readonly containsCache = new Map<string, string[]>();
+
+  constructor(known: ReadonlySet<string>) {
+    this.known = known;
+    // Default sort compares UTF-16 code units, the order startsWith ranges use.
+    this.sorted = [...known].sort();
   }
-  const scoped = `${prefix}.`;
-  const nested: string[] = [];
-  const contains: string[] = [];
-  for (const fqn of knownTests) {
-    if (fqn.startsWith(scoped)) {
-      nested.push(fqn);
-    } else if (fqn.includes(prefix)) {
-      contains.push(fqn);
+
+  withPrefix(prefix: string): string[] {
+    let lo = 0;
+    let hi = this.sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.sorted[mid] < prefix) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
     }
+    const matches: string[] = [];
+    while (lo < this.sorted.length && this.sorted[lo].startsWith(prefix)) {
+      matches.push(this.sorted[lo++]);
+    }
+    return matches;
   }
-  const matches = nested.length > 0 ? nested : contains;
-  return [...matches].sort((a, b) => a.localeCompare(b));
+
+  /** Substring matches (Visual Studio's default Contains operator); memoized per needle. */
+  containing(needle: string): string[] {
+    let matches = this.containsCache.get(needle);
+    if (!matches) {
+      matches = this.sorted.filter(fqn => fqn.includes(needle));
+      this.containsCache.set(needle, matches);
+    }
+    return matches;
+  }
 }
 
+function matchKnownTests(prefix: string, index: KnownTestIndex): string[] {
+  if (index.known.has(prefix)) {
+    return [prefix];
+  }
+  const nested = index.withPrefix(`${prefix}.`);
+  const matches = nested.length > 0 ? nested : index.containing(prefix);
+  return [...matches].sort(compareText);
+}
 function escapeXmlAttr(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -191,7 +228,7 @@ function escapeXmlAttr(value: string): string {
 export type PlaylistSaveFormat = 'v2' | 'v1';
 
 export function serializePlaylist(fqns: string[], format: PlaylistSaveFormat = 'v2'): string {
-  const sorted = [...fqns].sort((a, b) => a.localeCompare(b));
+  const sorted = [...fqns].sort(compareText);
   if (format === 'v1') {
     const body = sorted.map(fqn => `  <Add Test="${escapeXmlAttr(fqn)}" />`).join('\n');
     return `<Playlist Version="2.0">\n${body}${body ? '\n' : ''}</Playlist>\n`;

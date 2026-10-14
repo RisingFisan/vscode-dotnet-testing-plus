@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { PlaylistTest } from './playlistParser';
+import { compareText } from './collation';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 
@@ -50,7 +51,7 @@ export function updateGroupLabels(root: vscode.TestItem, testResultStates: Reado
   function computeGroup(item: vscode.TestItem): { passed: number; total: number } {
     if (item.children.size === 0) {
       // Leaf test item
-      const fqn = fqnFromTestItemId(item.id);
+      const fqn = fqnOfItem(item);
       const state = (fqn ? testResultStates.get(fqn) : undefined) ?? 'notRun';
       if (state === 'skipped') {
         return { passed: 0, total: 0 };
@@ -68,7 +69,10 @@ export function updateGroupLabels(root: vscode.TestItem, testResultStates: Reado
 
     const base = item.sortText ?? item.label;
     item.sortText = base;
-    item.label = formatGroupLabel(base, groupPassed, groupTotal);
+    const label = formatGroupLabel(base, groupPassed, groupTotal);
+    if (item.label !== label) {
+      item.label = label;
+    }
 
     return { passed: groupPassed, total: groupTotal };
   }
@@ -94,7 +98,7 @@ function countGroupTests(group: vscode.TestItem, testResultStates: ReadonlyMap<s
 
   function walk(item: vscode.TestItem): void {
     if (item.children.size === 0) {
-      const fqn = fqnFromTestItemId(item.id);
+      const fqn = fqnOfItem(item);
       const state = (fqn ? testResultStates.get(fqn) : undefined) ?? 'notRun';
       if (state !== 'skipped') {
         total += 1;
@@ -115,10 +119,26 @@ export function updateSingleGroupLabel(group: vscode.TestItem, testResultStates:
   const counts = countGroupTests(group, testResultStates);
   const base = group.sortText ?? group.label;
   group.sortText = base;
-  group.label = formatGroupLabel(base, counts.passed, counts.total);
+  const label = formatGroupLabel(base, counts.passed, counts.total);
+  if (group.label !== label) {
+    group.label = label;
+  }
 }
 
-function fqnFromTestItemId(id: string): string | undefined {
+// Decoding an id (split + decodeURIComponent) per leaf per label pass is the
+// hot spot of group-label updates; an item's id never changes, so memoize it.
+const fqnByItem = new WeakMap<vscode.TestItem, string | undefined>();
+
+function fqnOfItem(item: vscode.TestItem): string | undefined {
+  if (fqnByItem.has(item)) {
+    return fqnByItem.get(item);
+  }
+  const fqn = fqnFromTestItemId(item.id);
+  fqnByItem.set(item, fqn);
+  return fqn;
+}
+
+export function fqnFromTestItemId(id: string): string | undefined {
   if (!id.startsWith('test:')) {
     return undefined;
   }
@@ -201,7 +221,7 @@ export function buildSolutionPlaceholder(
 function sortChildrenRecursively(item: vscode.TestItem): void {
   const sorted: vscode.TestItem[] = [];
   item.children.forEach(child => sorted.push(child));
-  sorted.sort((a, b) => a.label.localeCompare(b.label));
+  sorted.sort((a, b) => compareText(a.label, b.label));
   item.children.replace(sorted);
   for (const child of sorted) {
     if (child.children.size > 0) {

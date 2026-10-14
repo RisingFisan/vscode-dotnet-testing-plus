@@ -3,14 +3,22 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { XMLParser } from 'fast-xml-parser';
 import { log, logCommand } from './logger';
-import { killProcessTree } from './processTree';
+import { killProcessTree, spawnTracked } from './processTree';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
+import { collectProjectCoverage, CoverageState, newCoverageState } from './coverage';
 
-const CHUNK_SIZE = 100;
+/**
+ * Upper bound for a single `--filter` argument. Windows caps a whole command
+ * line at 32,767 chars and Linux caps a single argument at 128 KB; 30,000
+ * chars stays safely under both. Tests are batched so no batch's filter
+ * exceeds this.
+ */
+const FILTER_ARG_LIMIT = 30000;
 
 interface TrxResult {
   fqn: string;
@@ -18,6 +26,11 @@ interface TrxResult {
   message?: string;
   stackTrace?: string;
   durationMs?: number;
+}
+
+export interface TestFailureLocations {
+  callSite?: vscode.Location;
+  innermostError?: vscode.Location;
 }
 
 export interface TestDescriptor {
@@ -39,12 +52,16 @@ interface RunOptions {
   projects?: Map<string, string>;
   /** Directory containing Playlist.TestLogger.dll; enables live per-test results. */
   loggerDir?: string;
-  chunkSize?: number;
+  /** Collect Cobertura coverage for every executed test. */
+  coverage?: boolean;
+  /** Per-run accumulator shared across solutions; survives the options spread. */
+  coverageState?: CoverageState;
   /** Test item ID -> solution-specific test metadata. */
   descriptors?: Map<string, TestDescriptor>;
   /** Auto-continue past the test host's initial Debugger.Break() when debugging. */
   skipPreBreakpoint?: boolean;
   onTestStateChange?: (test: vscode.TestItem, state: TestResultState, durationMs?: number) => void;
+  onTestFailureLocations?: (test: vscode.TestItem, locations: TestFailureLocations) => void;
 }
 
 function asArray<T>(value: T | T[] | undefined): T[] {
@@ -106,26 +123,30 @@ export async function runPlaylistTests(
   options?: RunOptions
 ): Promise<void> {
   const run = controller.createTestRun(request);
+  const coverageState = options?.coverage ? newCoverageState() : undefined;
+  const runOptions: RunOptions | undefined = options ? { ...options, coverageState } : options;
   // Two UI cancel paths exist: the Test Explorer's cancel fires the profile
   // handler token, while the Test Results view's cancel only fires the
   // TestRun's own token (it cancels a single task). Honor both.
   const cancel = new vscode.CancellationTokenSource();
-  token.onCancellationRequested(() => cancel.cancel());
-  run.token.onCancellationRequested(() => cancel.cancel());
+  const cancelSubs = [
+    token.onCancellationRequested(() => cancel.cancel()),
+    run.token.onCancellationRequested(() => cancel.cancel())
+  ];
   try {
     const tests = collectTestsToRun(controller, request);
 
-    const { groups: bySolution, unassigned } = groupTestsBySolution(tests, solutions, options);
-    unassigned.forEach(test => skipTest(run, test, options));
+    const { groups: bySolution, unassigned } = groupTestsBySolution(tests, solutions, runOptions);
+    unassigned.forEach(test => skipTest(run, test, runOptions));
     // Map insertion order follows the requested tree order, so all work for a
     // solution completes before the next solution is built or run.
     for (const [solutionPath, solutionTests] of bySolution) {
       if (cancel.token.isCancellationRequested) {
-        solutionTests.forEach(test => skipTest(run, test, options));
+        solutionTests.forEach(test => skipTest(run, test, runOptions));
         continue;
       }
       const solution = solutions.get(solutionPath)!;
-      await runSolutionTests(solutionTests, solution, run, cancel.token, debug, options);
+      await runSolutionTests(solutionTests, solution, run, cancel.token, debug, runOptions);
     }
   } catch (err) {
     // A cancelled run rejects the in-flight build/chunk promises; that's
@@ -136,7 +157,11 @@ export async function runPlaylistTests(
       throw err;
     }
   } finally {
+    for (const file of coverageState?.files ?? []) {
+      run.addCoverage(file);
+    }
     run.end();
+    cancelSubs.forEach(sub => sub.dispose());
     cancel.dispose();
   }
 }
@@ -171,7 +196,40 @@ function groupTestsBySolution(
 }
 
 function fqnFilter(tests: readonly vscode.TestItem[], options?: RunOptions): string {
-  return tests.map(test => `FullyQualifiedName=${descriptorFor(test, options)?.fullyQualifiedName ?? test.id}`).join('|');
+  return tests.map(test => filterEntryFor(test, options)).join('|');
+}
+
+function filterEntryFor(test: vscode.TestItem, options?: RunOptions): string {
+  return `FullyQualifiedName=${descriptorFor(test, options)?.fullyQualifiedName ?? test.id}`;
+}
+
+/**
+ * Batch tests so that no `dotnet test` invocation's `--filter` argument
+ * approaches the OS argument-length limit. Typical projects fit in one batch
+ * (one process, live results, no per-invocation startup overhead); only very
+ * large selections split across invocations.
+ */
+function batchByFilterLength(
+  tests: readonly vscode.TestItem[],
+  options?: RunOptions
+): vscode.TestItem[][] {
+  const batches: vscode.TestItem[][] = [];
+  let current: vscode.TestItem[] = [];
+  let length = 0;
+  for (const test of tests) {
+    const entry = filterEntryFor(test, options);
+    if (current.length > 0 && length + entry.length + 1 > FILTER_ARG_LIMIT) {
+      batches.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(test);
+    length += entry.length + 1;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
 }
 
 async function runSolutionTests(
@@ -182,7 +240,6 @@ async function runSolutionTests(
   debug: boolean,
   options?: RunOptions
 ): Promise<void> {
-  const chunkSize = options?.chunkSize && options.chunkSize > 0 ? options.chunkSize : CHUNK_SIZE;
   const groups = new Map<string, vscode.TestItem[]>();
   const unmapped: vscode.TestItem[] = [];
   for (const test of tests) {
@@ -206,18 +263,41 @@ async function runSolutionTests(
     return;
   }
   const solutionOptions: RunOptions = { ...options, runsettingsPath: solution.runsettingsPath };
-  await buildSolutionOnce(solution.solutionPath, run, token);
+  try {
+    await buildSolutionOnce(solution.solutionPath, run, token);
+  } catch (err) {
+    if (token.isCancellationRequested) {
+      throw err;
+    }
+    // A broken build only affects this solution; report it on its tests and
+    // let the remaining solutions in the request run.
+    const message = err instanceof Error ? err.message : String(err);
+    log(`[error] ${path.basename(solution.solutionPath)}: ${message}`);
+    appendOutput(run, `${message}\n`);
+    for (const projectTests of groups.values()) {
+      for (const test of projectTests) {
+        setTestState(solutionOptions, test, 'failed');
+        run.errored(test, new vscode.TestMessage(message));
+      }
+    }
+    return;
+  }
   for (const [csproj, projectTests] of groups) {
     if (token.isCancellationRequested) {
       projectTests.forEach(test => skipTest(run, test, solutionOptions));
       continue;
     }
-    for (let i = 0; i < projectTests.length; i += chunkSize) {
+    for (const batch of batchByFilterLength(projectTests, solutionOptions)) {
       if (token.isCancellationRequested) {
-        projectTests.slice(i).forEach(test => skipTest(run, test, solutionOptions));
-        break;
+        batch.forEach(test => skipTest(run, test, solutionOptions));
+        continue;
       }
-      await runChunk(csproj, projectTests.slice(i, i + chunkSize), run, token, debug, solutionOptions, true);
+      await runChunk(csproj, batch, run, token, debug, solutionOptions, true);
+    }
+    if (solutionOptions.coverageState) {
+      solutionOptions.coverageState.files.push(
+        ...await collectProjectCoverage(csproj, solutionOptions.coverageState)
+      );
     }
   }
 }
@@ -230,7 +310,30 @@ interface LiveContext {
   run: vscode.TestRun;
   options?: RunOptions;
   tests: vscode.TestItem[];
+  /** Test ids that have received a result (any outcome). */
   reported: Set<string>;
+  /** Aggregated outcome per test id; see {@link outcomeRank}. */
+  outcomes: Map<string, string>;
+  /** Lazily built FQN -> test items index. */
+  index?: Map<string, vscode.TestItem[]>;
+  /** TRX paths announced on stdout. */
+  trxFiles: string[];
+  /** TRX paths already parsed successfully (never parsed twice). */
+  parsedTrx: Set<string>;
+  /** Flush the stream-logger tail; set while a tailer is active. */
+  drainStream?: () => void;
+}
+
+function createLiveContext(run: vscode.TestRun, options: RunOptions | undefined, tests: vscode.TestItem[]): LiveContext {
+  return {
+    run,
+    options,
+    tests,
+    reported: new Set<string>(),
+    outcomes: new Map<string, string>(),
+    trxFiles: [],
+    parsedTrx: new Set<string>()
+  };
 }
 
 interface FailureInfo {
@@ -273,6 +376,46 @@ function parseStackTrace(stackTrace: string): vscode.TestMessageStackFrame[] {
   return frames;
 }
 
+function normalizeFilePath(file: string): string {
+  return file.replace(/\\/g, '/').toLowerCase();
+}
+
+function findCallSiteFrame(
+  frames: vscode.TestMessageStackFrame[],
+  testDeclLocation: SourceLocation | undefined,
+  testFqn: string
+): vscode.TestMessageStackFrame | undefined {
+  if (testDeclLocation?.file) {
+    const normDeclFile = normalizeFilePath(testDeclLocation.file);
+    const frameInDeclFile = frames.find(f => f.uri && normalizeFilePath(f.uri.fsPath) === normDeclFile);
+    if (frameInDeclFile) {
+      return frameInDeclFile;
+    }
+  }
+
+  // Fallback: match by class/method name from FQN against stack frame labels
+  const lastDot = testFqn.lastIndexOf('.');
+  const classOrMethod = lastDot === -1 ? testFqn : testFqn.slice(0, lastDot);
+  const bareMethod = lastDot === -1 ? testFqn : testFqn.slice(lastDot + 1);
+
+  return frames.find(f => {
+    if (!f.uri) {
+      return false;
+    }
+    const label = f.label;
+    return label.includes(testFqn) || (label.includes(bareMethod) && label.includes(classOrMethod));
+  });
+}
+
+/**
+ * Data-driven tests (MSTest DataRow, xUnit Theory, NUnit TestCase) emit one
+ * result per row, all mapping to the same test item. Aggregate them so the
+ * worst outcome wins: Failed > Passed > anything else (skipped/not executed).
+ */
+function outcomeRank(outcome: string): number {
+  return outcome === 'Failed' ? 3 : outcome === 'Passed' ? 2 : 1;
+}
+
 function reportOutcome(
   ctx: LiveContext,
   test: vscode.TestItem,
@@ -280,6 +423,11 @@ function reportOutcome(
   durationMs?: number,
   failure?: FailureInfo
 ): void {
+  const previous = ctx.outcomes.get(test.id);
+  if (previous !== undefined && outcomeRank(outcome) <= outcomeRank(previous)) {
+    return;
+  }
+  ctx.outcomes.set(test.id, outcome);
   ctx.reported.add(test.id);
   switch (outcome) {
     case 'Passed':
@@ -293,22 +441,31 @@ function reportOutcome(
       if (frames.length > 0) {
         message.stackTrace = frames;
       }
-      // Point at the line where the error actually happened (the topmost
-      // frame with file info); fall back to the test method declaration.
+      const testDeclLoc = descriptorFor(test, ctx.options)?.location ?? ctx.options?.locations?.get(test.id);
+      const testFqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
       const topFrame = frames.find(f => f.uri !== undefined && f.position !== undefined);
-      if (topFrame?.uri && topFrame.position) {
-        message.location = new vscode.Location(
-          topFrame.uri,
-          new vscode.Range(topFrame.position, topFrame.position)
-        );
-      } else {
-        const loc = descriptorFor(test, ctx.options)?.location ?? ctx.options?.locations?.get(test.id);
-        if (loc) {
-          message.location = new vscode.Location(
-            vscode.Uri.file(loc.file),
-            new vscode.Range(loc.line - 1, 0, loc.line - 1, 0)
-          );
-        }
+      const callSiteFrame = findCallSiteFrame(frames, testDeclLoc, testFqn);
+
+      const innermostLoc = topFrame?.uri && topFrame.position
+        ? new vscode.Location(topFrame.uri, new vscode.Range(topFrame.position, topFrame.position))
+        : (testDeclLoc ? new vscode.Location(vscode.Uri.file(testDeclLoc.file), new vscode.Range(testDeclLoc.line - 1, 0, testDeclLoc.line - 1, 0)) : undefined);
+
+      const callSiteLoc = callSiteFrame?.uri && callSiteFrame.position
+        ? new vscode.Location(callSiteFrame.uri, new vscode.Range(callSiteFrame.position, callSiteFrame.position))
+        : innermostLoc;
+
+      if (ctx.options?.onTestFailureLocations) {
+        ctx.options.onTestFailureLocations(test, {
+          callSite: callSiteLoc,
+          innermostError: innermostLoc
+        });
+      }
+
+      // Point at the call site within the test method, falling back to innermost error or test declaration
+      if (callSiteLoc) {
+        message.location = callSiteLoc;
+      } else if (innermostLoc) {
+        message.location = innermostLoc;
       }
       ctx.run.failed(test, message, durationMs);
       break;
@@ -320,25 +477,59 @@ function reportOutcome(
 }
 
 /**
+ * Index the chunk's tests by FQN once, so each streamed/TRX result is an O(1)
+ * lookup instead of a scan over every test in the batch.
+ */
+function ensureTestIndex(ctx: LiveContext): Map<string, vscode.TestItem[]> {
+  if (!ctx.index) {
+    const index = new Map<string, vscode.TestItem[]>();
+    for (const test of ctx.tests) {
+      const fqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
+      const list = index.get(fqn);
+      if (list) {
+        list.push(test);
+      } else {
+        index.set(fqn, [test]);
+      }
+    }
+    ctx.index = index;
+  }
+  return ctx.index;
+}
+
+/**
+ * Tests a result belongs to. Data-driven results can carry their arguments
+ * (`Ns.Class.Method(1,2)`); those map back to the bare `Ns.Class.Method` test.
+ */
+function testsForResult(ctx: LiveContext, resultFqn: string): readonly vscode.TestItem[] {
+  const index = ensureTestIndex(ctx);
+  const exact = index.get(resultFqn);
+  if (exact) {
+    return exact;
+  }
+  const paren = resultFqn.indexOf('(');
+  return paren > 0 ? index.get(resultFqn.slice(0, paren)) ?? [] : [];
+}
+
+function reportResult(ctx: LiveContext, result: StreamedResult & { fqn: string; outcome: string }): void {
+  for (const test of testsForResult(ctx, result.fqn)) {
+    reportOutcome(ctx, test, result.outcome, result.durationMs, {
+      message: result.message,
+      stackTrace: result.stackTrace
+    });
+  }
+}
+
+/**
  * Report results for whichever chunk tests appear in this TRX. Tests without a
  * matching result are left unreported (their TRX may not have been written
  * yet); the end-of-run sweep marks leftovers as skipped.
  */
 function reportMatchedResults(ctx: LiveContext, results: TrxResult[]): void {
-  const byFqn = new Map(results.map(r => [r.fqn, r]));
-  for (const test of ctx.tests) {
-    if (ctx.reported.has(test.id)) {
-      continue;
+  for (const result of results) {
+    if (result.fqn && result.outcome) {
+      reportResult(ctx, result);
     }
-    const fqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
-    const result = byFqn.get(fqn) ?? results.find(r => r.fqn.startsWith(fqn + '('));
-    if (!result) {
-      continue;
-    }
-    reportOutcome(ctx, test, result.outcome, result.durationMs, {
-      message: result.message,
-      stackTrace: result.stackTrace
-    });
   }
 }
 
@@ -361,35 +552,26 @@ function reportStreamedLine(ctx: LiveContext, line: string): void {
   } catch {
     return;
   }
-  if (!result.fqn || !result.outcome) {
+  if (!result || !result.fqn || !result.outcome) {
     return;
   }
-  for (const test of ctx.tests) {
-    if (ctx.reported.has(test.id)) {
-      continue;
-    }
-    const fqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
-    if (fqn !== result.fqn && !result.fqn.startsWith(fqn + '(')) {
-      continue;
-    }
-    reportOutcome(ctx, test, result.outcome, result.durationMs, {
-      message: result.message,
-      stackTrace: result.stackTrace
-    });
-    break;
-  }
+  reportResult(ctx, { ...result, fqn: result.fqn, outcome: result.outcome });
 }
 
 /**
  * Tail the JSONL file written by Playlist.TestLogger.dll so results are
  * reported the moment each test finishes. Returns an idempotent stop function
- * that drains any remaining content and closes the file.
+ * that drains any remaining content and closes the file. The drain function is
+ * also published on the context so the `Results File:` handler can flush the
+ * stream before deciding whether the TRX needs to be parsed at all.
  */
 function startStreamTailer(filePath: string, ctx: LiveContext): () => void {
   let offset = 0;
   let pending = '';
   let fd: number | undefined;
   let stopped = false;
+  // Reads can end mid-way through a multi-byte character.
+  const decoder = new StringDecoder('utf8');
 
   const drain = (): void => {
     try {
@@ -404,22 +586,30 @@ function startStreamTailer(filePath: string, ctx: LiveContext): () => void {
         return;
       }
       const buffer = Buffer.alloc(size - offset);
-      fs.readSync(fd, buffer, 0, buffer.length, offset);
-      offset = size;
-      pending += buffer.toString('utf8');
+      const read = fs.readSync(fd, buffer, 0, buffer.length, offset);
+      offset += read;
+      pending += decoder.write(buffer.subarray(0, read));
+      // Walk the buffer with an index and cut it once, not once per line.
+      let start = 0;
       let idx: number;
-      while ((idx = pending.indexOf('\n')) >= 0) {
-        const line = pending.slice(0, idx).replace(/\r$/, '').replace(/^\uFEFF/, '');
-        pending = pending.slice(idx + 1);
+      while ((idx = pending.indexOf('\n', start)) >= 0) {
+        const line = pending.slice(start, idx).replace(/\r$/, '').replace(/^\uFEFF/, '');
+        start = idx + 1;
         if (line.length > 0) {
-          reportStreamedLine(ctx, line);
+          try {
+            reportStreamedLine(ctx, line);
+          } catch (err) {
+            log(`[error] could not report streamed result: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
       }
+      pending = pending.slice(start);
     } catch {
       // file may not exist yet or be mid-write; the next tick retries
     }
   };
 
+  ctx.drainStream = drain;
   const timer = setInterval(drain, 500);
   return () => {
     if (stopped) {
@@ -435,10 +625,14 @@ function startStreamTailer(filePath: string, ctx: LiveContext): () => void {
         // ignore
       }
     }
+    ctx.drainStream = undefined;
   };
 }
 
 function processLine(ctx: LiveContext, rawLine: string, resultFiles: string[]): void {
+  if (!rawLine.includes('.trx')) {
+    return;
+  }
   const line = rawLine.replace(ANSI_RE, '');
   const fileMatch = RESULTS_FILE_LINE_RE.exec(line);
   if (!fileMatch) {
@@ -446,24 +640,48 @@ function processLine(ctx: LiveContext, rawLine: string, resultFiles: string[]): 
   }
   const trxPath = fileMatch[1].trim();
   resultFiles.push(trxPath);
+  ctx.trxFiles.push(trxPath);
+  // The stream logger writes every result before the TRX exists, so flush it
+  // first; when it already covered every test the TRX needs no parsing.
+  ctx.drainStream?.();
+  if (ctx.reported.size >= ctx.tests.length) {
+    return;
+  }
   // The TRX is fully written by the time this line is printed; parse it
   // immediately so results show up as each test project finishes.
   try {
     reportMatchedResults(ctx, readTrxResults(trxPath));
+    ctx.parsedTrx.add(trxPath);
   } catch {
     // The file may still be locked; the end-of-run sweep retries it.
   }
 }
 
-function createLineFeeder(ctx: LiveContext, resultFiles: string[]): (text: string) => void {
+interface LineFeeder {
+  feed: (text: string) => void;
+  flush: () => void;
+}
+
+function createLineFeeder(ctx: LiveContext, resultFiles: string[]): LineFeeder {
   let buffer = '';
-  return (text: string) => {
-    buffer += text;
-    let idx: number;
-    while ((idx = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, idx).replace(/\r$/, '');
-      buffer = buffer.slice(idx + 1);
-      processLine(ctx, line, resultFiles);
+  return {
+    feed: (text: string): void => {
+      buffer += text;
+      let start = 0;
+      let idx: number;
+      while ((idx = buffer.indexOf('\n', start)) >= 0) {
+        const line = buffer.slice(start, idx).replace(/\r$/, '');
+        start = idx + 1;
+        processLine(ctx, line, resultFiles);
+      }
+      buffer = buffer.slice(start);
+    },
+    flush: (): void => {
+      const line = buffer.trim();
+      buffer = '';
+      if (line.length > 0) {
+        processLine(ctx, line, resultFiles);
+      }
     }
   };
 }
@@ -477,31 +695,33 @@ function buildSolutionOnce(
   logCommand('dotnet', args);
   appendOutput(run, `Building solution: ${solutionPath}\n`);
   return new Promise((resolve, reject) => {
-    const child: ChildProcess = spawn('dotnet', args);
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      appendOutput(run, text);
+    const child: ChildProcess = spawnTracked('dotnet', args);
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    const cancelSub = token.onCancellationRequested(() => {
+      log('[cancel] dotnet build cancelled');
+      killProcessTree(child);
+      reject(new Error('Build cancelled'));
     });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      appendOutput(run, text);
-    });
+    child.stdout?.on('data', (text: string) => appendOutput(run, text));
+    child.stderr?.on('data', (text: string) => appendOutput(run, text));
     child.on('error', err => {
+      cancelSub.dispose();
       log(`[error] dotnet build failed: ${err.message}`);
       reject(err);
     });
     child.on('exit', code => {
+      cancelSub.dispose();
       if (code !== 0) {
         reject(new Error(`dotnet build failed with exit code ${code}`));
       } else {
         resolve();
       }
     });
-    token.onCancellationRequested(() => {
-      log('[cancel] dotnet build cancelled');
+    if (token.isCancellationRequested) {
       killProcessTree(child);
       reject(new Error('Build cancelled'));
-    });
+    }
   });
 }
 
@@ -531,11 +751,14 @@ async function runChunk(
   if (useStreamLogger) {
     args.push('--logger', 'playliststream', '--test-adapter-path', options!.loggerDir!);
   }
+  if (options?.coverage) {
+    args.push('--collect', 'XPlat Code Coverage');
+  }
   if (options?.runsettingsPath) {
     args.push('--settings', options.runsettingsPath);
   }
 
-  const ctx: LiveContext = { run, options, tests, reported: new Set<string>() };
+  const ctx = createLiveContext(run, options, tests);
   let resultFiles: string[] = [];
   const streamLogPath = useStreamLogger
     ? path.join(os.tmpdir(), `playlist-stream-${process.pid}-${Date.now()}-${crypto.randomUUID()}.jsonl`)
@@ -559,12 +782,20 @@ async function runChunk(
 
     log(`Collected ${resultFiles.length} TRX result file(s)`);
     // End-of-run sweep for TRX files that could not be parsed while streaming
-    // (e.g. still locked). Tests with no result anywhere are marked skipped.
-    for (const trxPath of resultFiles) {
-      try {
-        reportMatchedResults(ctx, readTrxResults(trxPath));
-      } catch {
-        // ignore unreadable TRX; unmatched tests are marked skipped below
+    // (e.g. still locked). It is skipped entirely when every test already has
+    // a result (the stream logger normally delivers them all), and a TRX that
+    // was already read successfully is never parsed a second time.
+    if (ctx.reported.size < ctx.tests.length) {
+      for (const trxPath of resultFiles) {
+        if (ctx.parsedTrx.has(trxPath)) {
+          continue;
+        }
+        try {
+          reportMatchedResults(ctx, readTrxResults(trxPath));
+          ctx.parsedTrx.add(trxPath);
+        } catch {
+          // ignore unreadable TRX; unmatched tests are marked skipped below
+        }
       }
     }
     for (const test of ctx.tests) {
@@ -594,15 +825,44 @@ async function runChunk(
         // best-effort cleanup
       }
     }
-    // dotnet test writes the TRX next to the test project; clean up what we parsed.
-    try {
-      for (const f of resultFiles) {
+    // dotnet test writes the TRX next to the test project; clean up every one
+    // we saw, including runs that errored or were cancelled before returning.
+    for (const f of new Set([...resultFiles, ...ctx.trxFiles])) {
+      try {
         fs.rmSync(f, { force: true });
+      } catch {
+        // best-effort cleanup
       }
-    } catch {
-      // best-effort cleanup
     }
   }
+}
+
+/**
+ * Wait (bounded) for a child's stdout to finish draining after it exits. The
+ * 'exit' event can precede the last buffered stdout chunk (which may carry the
+ * `Results File:` line), while waiting for 'close' can hang forever when an
+ * orphaned grandchild keeps the pipe open. A short cap covers both.
+ */
+function whenStdoutDrained(child: ChildProcess, callback: () => void): void {
+  const stdout = child.stdout;
+  if (!stdout || stdout.readableEnded || stdout.destroyed) {
+    callback();
+    return;
+  }
+  let done = false;
+  const fire = (): void => {
+    if (done) {
+      return;
+    }
+    done = true;
+    clearTimeout(timer);
+    callback();
+  };
+  const timer = setTimeout(fire, 1000);
+  stdout.once('end', fire);
+  stdout.once('close', fire);
+  stdout.once('error', fire);
+  child.once('close', fire);
 }
 
 function runDotnetTest(
@@ -618,39 +878,51 @@ function runDotnetTest(
   }
   return new Promise((resolve, reject) => {
     const resultFiles: string[] = [];
-    const feed = createLineFeeder(ctx, resultFiles);
+    const feeder = createLineFeeder(ctx, resultFiles);
     let sawStdout = false;
-    const child: ChildProcess = spawn('dotnet', args, {
+    const child: ChildProcess = spawnTracked('dotnet', args, {
       env: streamLogPath ? { ...process.env, PLAYLIST_STREAM_LOG: streamLogPath } : process.env
     });
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
 
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
+    // Dispose the listener when the child ends: the token is shared by every
+    // chunk of the run, so stale listeners would otherwise pile up and fire
+    // (against long-dead PIDs) on cancel.
+    const cancelSub = token.onCancellationRequested(() => {
+      log('[cancel] dotnet test run cancelled');
+      killProcessTree(child);
+    });
+
+    child.stdout?.on('data', (text: string) => {
       sawStdout = true;
       log(`[stdout] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
       appendOutput(run, text);
-      feed(text);
+      feeder.feed(text);
     });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
+    child.stderr?.on('data', (text: string) => {
       log(`[stderr] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
       appendOutput(run, text);
     });
     child.on('error', err => {
+      cancelSub.dispose();
       log(`[error] dotnet test failed: ${err.message}`);
       reject(err);
     });
     child.on('exit', code => {
-      if (code !== 0 && !sawStdout) {
-        reject(new Error(`dotnet test exited with code ${code}`));
-      } else {
-        resolve(resultFiles);
-      }
+      cancelSub.dispose();
+      whenStdoutDrained(child, () => {
+        feeder.flush();
+        if (code !== 0 && !sawStdout) {
+          reject(new Error(`dotnet test exited with code ${code}`));
+        } else {
+          resolve(resultFiles);
+        }
+      });
     });
-    token.onCancellationRequested(() => {
-      log('[cancel] dotnet test run cancelled');
+    if (token.isCancellationRequested) {
       killProcessTree(child);
-    });
+    }
   });
 }
 
@@ -666,71 +938,129 @@ function debugDotnetTest(
     run.appendOutput(`Using runsettings: ${ctx.options.runsettingsPath}\n`);
   }
   return new Promise((resolve, reject) => {
-    const child: ChildProcess = spawn('dotnet', args, {
+    const child: ChildProcess = spawnTracked('dotnet', args, {
       env: {
         ...process.env,
         VSTEST_HOST_DEBUG: '1',
         ...(streamLogPath ? { PLAYLIST_STREAM_LOG: streamLogPath } : {})
       }
     });
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
 
     const resultFiles: string[] = [];
-    const feed = createLineFeeder(ctx, resultFiles);
+    const feeder = createLineFeeder(ctx, resultFiles);
+    const disposables: vscode.Disposable[] = [];
     let buffer = '';
     let attached = false;
     let settled = false;
+    let debugSession: vscode.DebugSession | undefined;
     const settle = (err?: Error): void => {
-      if (!settled) {
-        settled = true;
-        if (err) {
-          reject(err);
-        } else {
-          resolve(resultFiles);
-        }
+      if (settled) {
+        return;
+      }
+      settled = true;
+      disposables.splice(0).forEach(d => d.dispose());
+      if (err) {
+        reject(err);
+      } else {
+        resolve(resultFiles);
+      }
+    };
+    const track = (d: vscode.Disposable): void => {
+      if (settled) {
+        d.dispose();
+      } else {
+        disposables.push(d);
       }
     };
 
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
+    track(token.onCancellationRequested(() => {
+      killProcessTree(child);
+      settle();
+    }));
+
+    child.stdout?.on('data', (text: string) => {
       log(`[stdout] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
       appendOutput(run, text);
-      feed(text);
+      feeder.feed(text);
       if (!attached) {
         buffer += text;
+        if (buffer.length > 100000) {
+          buffer = buffer.slice(-50000);
+        }
         const match = /Process Id:\s*(\d+)/.exec(buffer);
         if (match) {
           attached = true;
           log(`Attaching debugger to process ${match[1]}`);
-          void attachDebugger(Number(match[1]), child, settle, ctx.options?.skipPreBreakpoint ?? true);
+          attachDebugger(Number(match[1]), child, ctx.options?.skipPreBreakpoint ?? true, {
+            track,
+            onSession: session => {
+              debugSession = session;
+            },
+            onTerminated: () => {
+              debugSession = undefined;
+              settle();
+            }
+          }).catch(err => {
+            // An unhandled rejection here would leave the run hanging forever.
+            const message = err instanceof Error ? err.message : String(err);
+            log(`Debugger attach failed: ${message}`);
+            killProcessTree(child);
+            settle(new Error(`Could not start the debugger: ${message}`));
+          });
         }
       }
     });
 
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
+    child.stderr?.on('data', (text: string) => {
       log(`[stderr] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
       appendOutput(run, text);
     });
     child.on('error', err => settle(err));
+    // Settle when the process ends, attached or not: waiting only for the
+    // debug session to terminate could hang if that event never arrives.
     child.on('exit', () => {
-      if (!attached) {
+      whenStdoutDrained(child, () => {
+        feeder.flush();
+        if (debugSession) {
+          void Promise.resolve(vscode.debug.stopDebugging(debugSession)).catch(() => undefined);
+          debugSession = undefined;
+        }
         settle();
-      }
-    });
-    token.onCancellationRequested(() => {
-      killProcessTree(child);
-      settle();
+      });
     });
   });
+}
+
+interface DebugAttachHooks {
+  /** Register a disposable that is released when the run settles. */
+  track: (disposable: vscode.Disposable) => void;
+  onSession: (session: vscode.DebugSession) => void;
+  onTerminated: () => void;
 }
 
 async function attachDebugger(
   pid: number,
   child: ChildProcess,
-  settle: (err?: Error) => void,
-  skipPreBreakpoint: boolean
+  skipPreBreakpoint: boolean,
+  hooks: DebugAttachHooks
 ): Promise<void> {
   const sessionName = 'Attach to .NET Test Host';
+
+  // Register these before startDebugging so a session that starts or ends
+  // quickly cannot slip past us.
+  hooks.track(vscode.debug.onDidStartDebugSession(session => {
+    if (session.name === sessionName) {
+      hooks.onSession(session);
+    }
+  }));
+  hooks.track(vscode.debug.onDidTerminateDebugSession(session => {
+    if (session.name === sessionName) {
+      killProcessTree(child);
+      hooks.onTerminated();
+    }
+  }));
 
   // The vstest testhost calls Debugger.Break() right after a debugger attaches
   // (VSTEST_HOST_DEBUG), which shows up as a pause before any test runs.
@@ -765,6 +1095,7 @@ async function attachDebugger(
         };
       }
     });
+    hooks.track(tracker);
   }
 
   const started = await vscode.debug.startDebugging(undefined, {
@@ -776,21 +1107,10 @@ async function attachDebugger(
 
   if (!started) {
     log('Debugger attach failed. Is the C# extension installed?');
-    tracker?.dispose();
     killProcessTree(child);
-    settle(new Error('Could not start the debugger. Is the C# extension installed?'));
-    return;
+    throw new Error('Is the C# extension installed?');
   }
   log('Debugger attached successfully');
-
-  const disposable = vscode.debug.onDidTerminateDebugSession(session => {
-    if (session.name === sessionName) {
-      disposable.dispose();
-      tracker?.dispose();
-      killProcessTree(child);
-      settle();
-    }
-  });
 }
 
 function textOf(node: any): string | undefined {
@@ -825,10 +1145,11 @@ function parseDuration(duration?: string): number | undefined {
   return ms;
 }
 
+const TRX_PARSER = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+
 function readTrxResults(trxPath: string): TrxResult[] {
   const xml = fs.readFileSync(trxPath, 'utf8');
-  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-  const testRun = parser.parse(xml).TestRun;
+  const testRun = TRX_PARSER.parse(xml).TestRun;
 
   const fqnByTestId = new Map<string, string>();
   for (const def of asArray<any>(testRun?.TestDefinitions?.UnitTest)) {
@@ -863,3 +1184,8 @@ export const __reportStreamedLineForTest = reportStreamedLine;
 export const __collectTestsToRunForTest = collectTestsToRun;
 export const __groupTestsBySolutionForTest = groupTestsBySolution;
 export const __fqnFilterForTest = fqnFilter;
+export const __batchByFilterLengthForTest = batchByFilterLength;
+export const __createLiveContextForTest = createLiveContext;
+export const __reportMatchedResultsForTest = reportMatchedResults;
+export const __startStreamTailerForTest = startStreamTailer;
+export const __runSolutionTestsForTest = runSolutionTests;

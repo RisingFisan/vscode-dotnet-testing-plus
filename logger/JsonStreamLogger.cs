@@ -16,16 +16,45 @@ namespace Playlist
     [FriendlyName("playliststream")]
     public class JsonStreamLogger : ITestLogger
     {
-        private string outputPath;
+        private readonly object gate = new object();
+        private StreamWriter writer;
+        private bool warned;
 
         public void Initialize(TestLoggerEvents events, string testRunDirectory)
         {
-            this.outputPath = Environment.GetEnvironmentVariable("PLAYLIST_STREAM_LOG");
-            if (string.IsNullOrEmpty(this.outputPath))
+            var outputPath = Environment.GetEnvironmentVariable("PLAYLIST_STREAM_LOG");
+            if (string.IsNullOrEmpty(outputPath))
             {
-                this.outputPath = Path.Combine(testRunDirectory ?? ".", "playlist-stream.jsonl");
+                outputPath = Path.Combine(testRunDirectory ?? ".", "playlist-stream.jsonl");
             }
+
+            try
+            {
+                // One handle for the whole run (instead of open/close per result);
+                // AutoFlush keeps every line visible to the extension immediately.
+                // FileShare.ReadWrite lets the extension tail the file meanwhile.
+                var stream = new FileStream(outputPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                this.writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+            }
+            catch (Exception ex)
+            {
+                this.Warn("could not open " + outputPath + ": " + ex.Message);
+            }
+
             events.TestResult += this.OnTestResult;
+            events.TestRunComplete += this.OnTestRunComplete;
+        }
+
+        private void OnTestRunComplete(object sender, TestRunCompleteEventArgs e)
+        {
+            lock (this.gate)
+            {
+                if (this.writer != null)
+                {
+                    this.writer.Dispose();
+                    this.writer = null;
+                }
+            }
         }
 
         private void OnTestResult(object sender, TestResultEventArgs e)
@@ -41,7 +70,32 @@ namespace Playlist
                     "\"message\":" + JsonEscape(r.ErrorMessage) + "," +
                     "\"stackTrace\":" + JsonEscape(r.ErrorStackTrace) +
                     "}\n";
-                File.AppendAllText(this.outputPath, line, Encoding.UTF8);
+                lock (this.gate)
+                {
+                    if (this.writer != null)
+                    {
+                        this.writer.Write(line);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // The extension falls back to the TRX when lines are missing, so a
+                // failure must never fail the run; say so once instead of silently.
+                this.Warn("could not write a result: " + ex.Message);
+            }
+        }
+
+        private void Warn(string message)
+        {
+            if (this.warned)
+            {
+                return;
+            }
+            this.warned = true;
+            try
+            {
+                Console.Error.WriteLine("playliststream logger: " + message);
             }
             catch
             {

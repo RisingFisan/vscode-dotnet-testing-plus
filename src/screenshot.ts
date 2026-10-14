@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { PlaylistTest } from './playlistParser';
 import { TestResultState } from './testResultFilter';
+import { compareText } from './collation';
 
 export type ScreenshotGroupBy = 'project' | 'class' | 'test';
 export type ScreenshotState = 'passed' | 'failed' | 'skipped' | 'notRun';
@@ -132,7 +133,7 @@ function makeGroup(kind: ScreenshotGroup['kind'], label: string, children: Scree
 }
 
 function sortNodes(nodes: ScreenshotNode[]): ScreenshotNode[] {
-  return nodes.sort((a, b) => a.label.localeCompare(b.label));
+  return nodes.sort((a, b) => compareText(a.label, b.label));
 }
 
 export function buildScreenshotSnapshot(data: ScreenshotSessionData[], options: ScreenshotOptions): ScreenshotSnapshot {

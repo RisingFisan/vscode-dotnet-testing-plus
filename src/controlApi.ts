@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import * as http from 'http';
 import * as vscode from 'vscode';
 import { log } from './logger';
@@ -114,6 +115,14 @@ async function handleRequest(
   handlers: ControlApiHandlers
 ): Promise<void> {
   try {
+    // Browsers can reach a loopback server too. A page the user happens to
+    // visit could otherwise POST /run or /playlist (cross-origin 'simple'
+    // requests need no preflight) or rebind its DNS name to 127.0.0.1. Agents
+    // and curl send neither an Origin header nor a foreign Host.
+    if (req.headers.origin !== undefined || !isLoopbackHost(req.headers.host)) {
+      sendJson(res, 403, { error: 'Forbidden: browser/cross-origin requests are not accepted.' });
+      return;
+    }
     if (token && !isAuthorized(req, token)) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
@@ -134,7 +143,8 @@ async function handleRequest(
         return;
       }
       case '/tests': {
-        sendJson(res, 200, handlers.getTests(optionalQuery(url, 'solution')));
+        // Potentially tens of thousands of entries: skip pretty-printing.
+        sendJson(res, 200, handlers.getTests(optionalQuery(url, 'solution')), false);
         return;
       }
       case '/log': {
@@ -196,9 +206,25 @@ async function handleRequest(
   }
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+function isLoopbackHost(hostHeader: string | undefined): boolean {
+  if (!hostHeader) {
+    return false;
+  }
+  // Strip an optional :port (IPv6 literals keep their brackets).
+  const host = hostHeader.replace(/:\d+$/, '').toLowerCase();
+  return LOOPBACK_HOSTS.has(host);
+}
+
 function isAuthorized(req: http.IncomingMessage, token: string): boolean {
   const header = req.headers.authorization ?? '';
-  return typeof header === 'string' && header === `Bearer ${token}`;
+  if (typeof header !== 'string') {
+    return false;
+  }
+  // Constant-time comparison (hash both sides so lengths always match).
+  const digest = (value: string): Buffer => crypto.createHash('sha256').update(value).digest();
+  return crypto.timingSafeEqual(digest(header), digest(`Bearer ${token}`));
 }
 
 function optionalQuery(url: URL, name: string): string | undefined {
@@ -215,11 +241,17 @@ function readJson(req: http.IncomingMessage): Promise<any> {
     if (!raw.trim()) {
       return {};
     }
+    let parsed: unknown;
     try {
-      return JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
       throw new ControlApiError(400, 'Invalid JSON body.');
     }
+    // Handlers read named fields; null, arrays and scalars would throw.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ControlApiError(400, 'JSON body must be an object.');
+    }
+    return parsed;
   });
 }
 
@@ -241,7 +273,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+function sendJson(res: http.ServerResponse, status: number, payload: unknown, pretty = true): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(`${JSON.stringify(payload, null, 2)}\n`);
+  res.end(`${JSON.stringify(payload, null, pretty ? 2 : undefined)}\n`);
 }

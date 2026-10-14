@@ -24,6 +24,7 @@ interface QualifierContext {
 
 const QUALIFIER_RE = /^(class|project)([:=])(.+)$/i;
 const BARE_QUALIFIER_RE = /^(class|project)([:=])$/i;
+const MAX_GROUP_DEPTH = 64;
 
 function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
@@ -66,11 +67,24 @@ function tokenize(input: string): Token[] {
 // work). The parser is tolerant: empty operands and stray parens are dropped.
 class Parser {
   private pos = 0;
+  private depth = 0;
 
   constructor(private readonly tokens: Token[]) {}
 
   parse(): FilterNode | undefined {
-    return this.parseOr(undefined);
+    // A stray ')' ends the inner parse early; drop it and keep going, AND-ing
+    // what follows, so trailing terms are never silently discarded.
+    const children: FilterNode[] = [];
+    while (this.pos < this.tokens.length) {
+      const node = this.parseOr(undefined);
+      if (node) {
+        children.push(node);
+      }
+      if (this.peek()?.type === 'rparen') {
+        this.pos++;
+      }
+    }
+    return combine('and', children);
   }
 
   private peek(): Token | undefined {
@@ -115,6 +129,25 @@ class Parser {
     return combine('and', children);
   }
 
+  /** Parse the inside of a '(' ... ')' group (the '(' is already consumed). */
+  private parseGroup(inherited: QualifierContext | undefined): FilterNode | undefined {
+    // Cap nesting so absurd input cannot overflow the stack; a too-deep group
+    // is dropped like any other malformed fragment.
+    if (this.depth >= MAX_GROUP_DEPTH) {
+      return undefined;
+    }
+    this.depth++;
+    try {
+      const inner = this.parseOr(inherited);
+      if (this.peek()?.type === 'rparen') {
+        this.pos++;
+      }
+      return inner;
+    } finally {
+      this.depth--;
+    }
+  }
+
   private parseUnary(inherited: QualifierContext | undefined): FilterNode | undefined {
     const token = this.peek();
     if (!token) {
@@ -122,11 +155,7 @@ class Parser {
     }
     if (token.type === 'lparen') {
       this.pos++;
-      const inner = this.parseOr(inherited);
-      if (this.peek()?.type === 'rparen') {
-        this.pos++;
-      }
-      return inner;
+      return this.parseGroup(inherited);
     }
     if (token.type === 'term') {
       this.pos++;
@@ -138,11 +167,7 @@ class Parser {
           kind: bare[1].toLowerCase() as TermKind,
           op: bare[2] === '=' ? 'exact' : 'contains'
         };
-        const inner = this.parseOr(context);
-        if (this.peek()?.type === 'rparen') {
-          this.pos++;
-        }
-        return inner;
+        return this.parseGroup(context);
       }
       const qualified = QUALIFIER_RE.exec(token.text);
       const kind = qualified ? (qualified[1].toLowerCase() as TermKind) : inherited?.kind ?? 'name';
@@ -176,26 +201,36 @@ export function parseTestFilter(input: string): TestFilter | undefined {
   return { raw, root };
 }
 
-function matchesNode(node: FilterNode, entry: PlaylistTest): boolean {
-  if (node.type === 'or') {
-    return node.children.some(child => matchesNode(child, entry));
-  }
-  if (node.type === 'and') {
-    return node.children.every(child => matchesNode(child, entry));
-  }
-  const haystack =
-    node.kind === 'class' ? entry.className :
-    node.kind === 'project' ? entry.project :
-    entry.testName;
-  if (haystack === undefined) {
-    return false;
-  }
-  const lowerHaystack = haystack.toLowerCase();
-  return node.op === 'exact' ? lowerHaystack === node.value : lowerHaystack.includes(node.value);
+/** Lowercased entry fields, computed at most once per entry per evaluation. */
+interface LowerFields {
+  class?: string;
+  project?: string;
+  name?: string;
 }
 
+function lowerField(entry: PlaylistTest, fields: LowerFields, kind: TermKind): string | undefined {
+  if (!(kind in fields)) {
+    const source = kind === 'class' ? entry.className : kind === 'project' ? entry.project : entry.testName;
+    fields[kind] = source?.toLowerCase();
+  }
+  return fields[kind];
+}
+
+function matchesNode(node: FilterNode, entry: PlaylistTest, fields: LowerFields): boolean {
+  if (node.type === 'or') {
+    return node.children.some(child => matchesNode(child, entry, fields));
+  }
+  if (node.type === 'and') {
+    return node.children.every(child => matchesNode(child, entry, fields));
+  }
+  const lowerHaystack = lowerField(entry, fields, node.kind);
+  if (lowerHaystack === undefined) {
+    return false;
+  }
+  return node.op === 'exact' ? lowerHaystack === node.value : lowerHaystack.includes(node.value);
+}
 export function matchesTestFilter(filter: TestFilter, entry: PlaylistTest): boolean {
-  return matchesNode(filter.root, entry);
+  return matchesNode(filter.root, entry, {});
 }
 
 export function filterEntries(entries: PlaylistTest[], filter: TestFilter | undefined): PlaylistTest[] {
