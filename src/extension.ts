@@ -131,7 +131,7 @@ const failureLocations = new Map<string, TestFailureLocations>();
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.24.0, multi-solution discovery)');
+  log('Extension activated (v1.24.1, multi-solution discovery)');
   extensionContext = context;
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
