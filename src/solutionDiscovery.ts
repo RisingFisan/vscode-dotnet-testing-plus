@@ -149,7 +149,11 @@ function runListTests(
       if (stdoutBuffer.length < MAX_STDOUT_BUFFER) {
         stdoutBuffer += text;
       }
-      lineRemainder += text;
+      // Same cap as stdoutBuffer: a pathologically long unterminated line
+      // must not grow the remainder without bound either.
+      if (lineRemainder.length < MAX_STDOUT_BUFFER) {
+        lineRemainder += text;
+      }
       const lines = lineRemainder.split(/\r?\n|\r/);
       lineRemainder = lines.pop() ?? '';
       for (const line of lines) {
