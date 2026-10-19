@@ -6,6 +6,7 @@ type MatchOperator = 'contains' | 'exact';
 type FilterNode =
   | { type: 'or'; children: FilterNode[] }
   | { type: 'and'; children: FilterNode[] }
+  | { type: 'not'; child: FilterNode }
   | { type: 'term'; kind: TermKind; op: MatchOperator; value: string };
 
 export interface TestFilter {
@@ -14,7 +15,7 @@ export interface TestFilter {
 }
 
 type Token =
-  | { type: 'lparen' | 'rparen' | 'or' | 'and' }
+  | { type: 'lparen' | 'rparen' | 'or' | 'and' | 'not' }
   | { type: 'term'; text: string };
 
 interface QualifierContext {
@@ -45,9 +46,12 @@ function tokenize(input: string): Token[] {
     } else if (ch === '&') {
       tokens.push({ type: 'and' });
       i++;
+    } else if (ch === '!') {
+      tokens.push({ type: 'not' });
+      i++;
     } else {
       let j = i;
-      while (j < input.length && !/[\s()|&]/.test(input[j])) {
+      while (j < input.length && !/[\s()|&!]/.test(input[j])) {
         j++;
       }
       tokens.push({ type: 'term', text: input.slice(i, j) });
@@ -60,11 +64,13 @@ function tokenize(input: string): Token[] {
 // Grammar (spaces are insignificant):
 //   expr  := and ('|' and)*
 //   and   := unary (('&' | juxtaposition) unary)*
-//   unary := term | [class:|class=|project:|project=] '(' expr ')' | '(' expr ')'
-// A class/project qualifier with ':' (contains) or '=' (exact match) on a term or parenthesized group sets the match
-// kind and operator; a qualifier inside a group overrides an inherited one. Adjacent terms
-// with no operator are implicitly AND-ed (so old space-separated filters still
-// work). The parser is tolerant: empty operands and stray parens are dropped.
+//   unary := '!' unary | [class:|class=|project:|project=] unary | '(' expr ')' | term
+// A class/project qualifier with ':' (contains) or '=' (exact match) on a term, negated term,
+// or parenthesized group sets the match kind and operator; a qualifier inside a group overrides
+// an inherited one. The negative modifier '!' inverts the match condition (e.g. !testName,
+// class:!className, project=!fullProjectName). Adjacent terms with no operator are implicitly
+// AND-ed (so old space-separated filters still work). The parser is tolerant: empty operands and
+// stray parens are dropped.
 class Parser {
   private pos = 0;
   private depth = 0;
@@ -117,10 +123,10 @@ class Parser {
       const token = this.peek();
       if (token?.type === 'and') {
         this.pos++;
-      } else if (token?.type !== 'term' && token?.type !== 'lparen') {
+      } else if (token?.type !== 'term' && token?.type !== 'lparen' && token?.type !== 'not') {
         break;
       }
-      // A term or '(' directly after another operand is an implicit AND.
+      // A term, '(', or '!' directly after another operand is an implicit AND.
       const next = this.parseUnary(inherited);
       if (next) {
         children.push(next);
@@ -149,6 +155,9 @@ class Parser {
   }
 
   private parseUnary(inherited: QualifierContext | undefined): FilterNode | undefined {
+    if (this.depth >= MAX_GROUP_DEPTH) {
+      return undefined;
+    }
     const token = this.peek();
     if (!token) {
       return undefined;
@@ -157,17 +166,33 @@ class Parser {
       this.pos++;
       return this.parseGroup(inherited);
     }
+    if (token.type === 'not') {
+      this.pos++;
+      this.depth++;
+      try {
+        const child = this.parseUnary(inherited);
+        if (!child) {
+          return undefined;
+        }
+        return child.type === 'not' ? child.child : { type: 'not', child };
+      } finally {
+        this.depth--;
+      }
+    }
     if (token.type === 'term') {
       this.pos++;
       const bare = BARE_QUALIFIER_RE.exec(token.text);
-      if (bare && this.peek()?.type === 'lparen') {
-        // e.g. class:(a|b) or class=(a|b) — the qualifier distributes over the group.
-        this.pos++;
-        const context: QualifierContext = {
-          kind: bare[1].toLowerCase() as TermKind,
-          op: bare[2] === '=' ? 'exact' : 'contains'
-        };
-        return this.parseGroup(context);
+      if (bare) {
+        this.depth++;
+        try {
+          const context: QualifierContext = {
+            kind: bare[1].toLowerCase() as TermKind,
+            op: bare[2] === '=' ? 'exact' : 'contains'
+          };
+          return this.parseUnary(context);
+        } finally {
+          this.depth--;
+        }
       }
       const qualified = QUALIFIER_RE.exec(token.text);
       const kind = qualified ? (qualified[1].toLowerCase() as TermKind) : inherited?.kind ?? 'name';
@@ -222,6 +247,9 @@ function matchesNode(node: FilterNode, entry: PlaylistTest, fields: LowerFields)
   }
   if (node.type === 'and') {
     return node.children.every(child => matchesNode(child, entry, fields));
+  }
+  if (node.type === 'not') {
+    return !matchesNode(node.child, entry, fields);
   }
   const lowerHaystack = lowerField(entry, fields, node.kind);
   if (lowerHaystack === undefined) {
