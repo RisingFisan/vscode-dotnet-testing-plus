@@ -234,50 +234,18 @@ export async function inspectRunsettings(
     };
   });
 
-  const allOverrides = { ...permanentValuesRecord, ...normalized.overrides };
-  const unresolved = Object.keys(allOverrides)
-    .filter(key => !knownKeys.has(key))
-    .map(key => `Setting no longer exists: ${key}`);
-
-  const baseNames = new Set(parameters.map(parameter => parameter.name.trim().toLowerCase()));
-  const customNames = new Set<string>();
-
   // Tag custom parameters from state (temporary unless matching permanent)
   const permanentParamIds = new Set(permanentParametersList.map(p => p.id));
+  const customParameters: CustomRunsettingsParameter[] = combineCustomParameters(normalized.parameters, permanentParametersList)
+    .map(parameter => ({ ...parameter, isPermanent: permanentParamIds.has(parameter.id) }));
 
-  const customParameters: CustomRunsettingsParameter[] = [];
-
-  // Add temporary parameters
-  normalized.parameters.forEach(parameter => {
-    const isPerm = permanentParamIds.has(parameter.id);
-    customParameters.push({
-      ...parameter,
-      isPermanent: isPerm
-    });
-  });
-
-  // Also include any permanent custom parameters not already in normalized.parameters
-  permanentParametersList.forEach(permParam => {
-    if (!customParameters.some(p => p.id === permParam.id || p.name.trim().toLowerCase() === permParam.name.trim().toLowerCase())) {
-      customParameters.push({
-        ...permParam,
-        isPermanent: true
-      });
-    }
-  });
-
-  customParameters.forEach(parameter => {
-    const normalizedName = parameter.name.trim().toLowerCase();
-    if (!normalizedName) {
-      unresolved.push(`Custom parameter "${parameter.id}" has a blank name.`);
-    } else if (baseNames.has(normalizedName)) {
-      unresolved.push(`Custom parameter "${parameter.name}" conflicts with the base runsettings file.`);
-    } else if (customNames.has(normalizedName)) {
-      unresolved.push(`Custom parameter "${parameter.name}" duplicates another custom parameter.`);
-    } else {
-      customNames.add(normalizedName);
-    }
-  });
+  const unresolved = [
+    ...unresolvedSettingMessages(mergeOverrides(normalized, normalizedPermanent), knownKeys),
+    ...validateCustomParameters(
+      customParameters,
+      new Set(parameters.map(parameter => parameter.name.trim().toLowerCase()))
+    ).messages
+  ];
 
   // Collect permanent values & parameters for dedicated section
   const permanentValues = values.filter(v => v.isPermanent);
@@ -309,10 +277,7 @@ export async function materializeRunsettings(
   parsed.parameters.forEach(parameter => knownKeys.add(parameter.key));
 
   const normalizedPermanent = normalizePermanentRunsettingsConfig(permanentConfig);
-  const mergedOverrides: Record<string, string> = {
-    ...(normalizedPermanent.values ?? {}),
-    ...state.overrides
-  };
+  const mergedOverrides = mergeOverrides(state, normalizedPermanent);
 
   const replacements: Replacement[] = [];
   parsed.values.forEach(value => {
@@ -334,37 +299,17 @@ export async function materializeRunsettings(
     }
   });
 
-  const unresolved = Object.keys(mergedOverrides)
-    .filter(key => !knownKeys.has(key))
-    .map(key => `Setting no longer exists: ${key}`);
+  const validation = validateCustomParameters(
+    combineCustomParameters(state.parameters, normalizedPermanent.parameters ?? []),
+    new Set(parsed.parameters.map(parameter => parameter.name.trim().toLowerCase()))
+  );
+  const unresolved = [
+    ...unresolvedSettingMessages(mergedOverrides, knownKeys),
+    ...validation.messages
+  ];
 
-  const baseNames = new Set(parsed.parameters.map(parameter => parameter.name.trim().toLowerCase()));
-  const customNames = new Set<string>();
-  const validParameters: CustomRunsettingsParameter[] = [];
-
-  const combinedCustomParameters: CustomRunsettingsParameter[] = [...state.parameters];
-  (normalizedPermanent.parameters ?? []).forEach(permParam => {
-    if (!combinedCustomParameters.some(p => p.id === permParam.id || p.name.trim().toLowerCase() === permParam.name.trim().toLowerCase())) {
-      combinedCustomParameters.push(permParam);
-    }
-  });
-
-  combinedCustomParameters.forEach(parameter => {
-    const normalizedName = parameter.name.trim().toLowerCase();
-    if (!normalizedName) {
-      unresolved.push(`Custom parameter "${parameter.id}" has a blank name.`);
-    } else if (baseNames.has(normalizedName)) {
-      unresolved.push(`Custom parameter "${parameter.name}" conflicts with the base runsettings file.`);
-    } else if (customNames.has(normalizedName)) {
-      unresolved.push(`Custom parameter "${parameter.name}" duplicates another custom parameter.`);
-    } else {
-      customNames.add(normalizedName);
-      validParameters.push(parameter);
-    }
-  });
-
-  if (validParameters.length > 0) {
-    const insertion = createParameterInsertion(parsed, validParameters);
+  if (validation.valid.length > 0) {
+    const insertion = createParameterInsertion(parsed, validation.valid);
     replacements.push(insertion);
   }
 
@@ -383,6 +328,64 @@ export async function materializeRunsettings(
 
 function hasOwn(record: Record<string, string>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/**
+ * Permanent overrides first, session overrides on top — inspect's message set
+ * and materialize's file content must agree on which value wins.
+ */
+function mergeOverrides(state: CustomRunsettingsState, permanent: PermanentRunsettingsConfig): Record<string, string> {
+  return { ...(permanent.values ?? {}), ...state.overrides };
+}
+
+function unresolvedSettingMessages(overrides: Record<string, string>, knownKeys: ReadonlySet<string>): string[] {
+  return Object.keys(overrides)
+    .filter(key => !knownKeys.has(key))
+    .map(key => `Setting no longer exists: ${key}`);
+}
+
+/**
+ * Session parameters first, then any permanent parameters they don't already
+ * cover (same id, or same normalized name).
+ */
+function combineCustomParameters(
+  stateParameters: CustomRunsettingsParameter[],
+  permanentParameters: CustomRunsettingsParameter[]
+): CustomRunsettingsParameter[] {
+  const combined = [...stateParameters];
+  permanentParameters.forEach(permParam => {
+    if (!combined.some(p => p.id === permParam.id || p.name.trim().toLowerCase() === permParam.name.trim().toLowerCase())) {
+      combined.push(permParam);
+    }
+  });
+  return combined;
+}
+
+/**
+ * Blank / base-conflict / duplicate validation shared by inspect (which only
+ * needs the messages) and materialize (which also keeps the valid subset).
+ */
+function validateCustomParameters(
+  parameters: CustomRunsettingsParameter[],
+  baseNames: ReadonlySet<string>
+): { messages: string[]; valid: CustomRunsettingsParameter[] } {
+  const messages: string[] = [];
+  const valid: CustomRunsettingsParameter[] = [];
+  const customNames = new Set<string>();
+  parameters.forEach(parameter => {
+    const normalizedName = parameter.name.trim().toLowerCase();
+    if (!normalizedName) {
+      messages.push(`Custom parameter "${parameter.id}" has a blank name.`);
+    } else if (baseNames.has(normalizedName)) {
+      messages.push(`Custom parameter "${parameter.name}" conflicts with the base runsettings file.`);
+    } else if (customNames.has(normalizedName)) {
+      messages.push(`Custom parameter "${parameter.name}" duplicates another custom parameter.`);
+    } else {
+      customNames.add(normalizedName);
+      valid.push(parameter);
+    }
+  });
+  return { messages, valid };
 }
 
 function parseRunsettingsXml(xml: string): ParsedRunsettings {
@@ -670,9 +673,16 @@ function encodeXml(value: string): string {
 }
 
 function decodeXml(value: string): string {
+  // Out-of-range entities (above U+10FFFF, or too long to parse) would make
+  // String.fromCodePoint throw and kill the whole runsettings parse; keep
+  // the raw entity text instead.
+  const decodeEntity = (match: string, code: string, radix: number): string => {
+    const codePoint = parseInt(code, radix);
+    return Number.isNaN(codePoint) || codePoint > 0x10ffff ? match : String.fromCodePoint(codePoint);
+  };
   return value
-    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(parseInt(code, 16)))
-    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(parseInt(code, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (match, code: string) => decodeEntity(match, code, 16))
+    .replace(/&#(\d+);/g, (match, code: string) => decodeEntity(match, code, 10))
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&lt;/g, '<')
@@ -717,11 +727,4 @@ export function findDefaultRunsettings(solutionPath: string): string | undefined
   }
 
   return candidates.sort((left, right) => left.localeCompare(right))[0];
-}
-
-export function resolveRunsettingsPath(solutionPath: string, explicitPath: string | undefined): string | undefined {
-  if (explicitPath && fs.existsSync(explicitPath)) {
-    return explicitPath;
-  }
-  return findDefaultRunsettings(solutionPath);
 }
