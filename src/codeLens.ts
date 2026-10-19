@@ -25,6 +25,30 @@ interface LocatedTest {
  */
 export function registerCodeLenses(getSessions: () => Iterable<CodeLensSession>): CodeLensHandle {
   const emitter = new vscode.EventEmitter<void>();
+  // Lenses are requested per open document and re-requested on editor
+  // changes, while the tree only changes on notify: index each session tree
+  // per file lazily and drop the whole index when the tree changes.
+  let indexByRoot: WeakMap<vscode.TestItem, Map<string, LocatedTest[]>> | undefined;
+
+  const locatedTests = (root: vscode.TestItem, fsPath: string): LocatedTest[] => {
+    if (!indexByRoot) {
+      indexByRoot = new WeakMap<vscode.TestItem, Map<string, LocatedTest[]>>();
+    }
+    const byRoot = indexByRoot;
+    let byFile = byRoot.get(root);
+    if (!byFile) {
+      byFile = new Map<string, LocatedTest[]>();
+      byRoot.set(root, byFile);
+    }
+    const cached = byFile.get(fsPath);
+    if (cached) {
+      return cached;
+    }
+    const found = findTestsInDocument(root, fsPath);
+    byFile.set(fsPath, found);
+    return found;
+  };
+
   const provider = vscode.languages.registerCodeLensProvider('csharp', {
     onDidChangeCodeLenses: emitter.event,
     provideCodeLenses(document: vscode.TextDocument, token: vscode.CancellationToken): vscode.CodeLens[] {
@@ -36,7 +60,7 @@ export function registerCodeLenses(getSessions: () => Iterable<CodeLensSession>)
         if (!session.treeRoot) {
           continue;
         }
-        for (const { item, fqn } of findTestsInDocument(session.treeRoot, document.uri.fsPath)) {
+        for (const { item, fqn } of locatedTests(session.treeRoot, document.uri.fsPath)) {
           const range = item.range ?? new vscode.Range(0, 0, 0, 0);
           lenses.push(makeLens(range, session.key, fqn, false));
           lenses.push(makeLens(range, session.key, fqn, true));
@@ -46,8 +70,11 @@ export function registerCodeLenses(getSessions: () => Iterable<CodeLensSession>)
     }
   });
   return {
-    notify: () => emitter.fire(),
-    dispose: () => {
+    notify: (): void => {
+      indexByRoot = undefined;
+      emitter.fire();
+    },
+    dispose: (): void => {
       provider.dispose();
       emitter.dispose();
     }
