@@ -2263,8 +2263,8 @@ async function updateViewState(): Promise<void> {
     skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
     controlApiEnabled: controlApiSessionEnabled || vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('controlApiEnabled', false),
     controlApi: apiCoordinator?.state,
-    controlApiUrl: apiCoordinator?.state.port !== undefined && apiCoordinator.state.sessionId
-      ? `http://localhost:${apiCoordinator.state.port}/${encodeURIComponent(apiCoordinator.state.sessionId)}/`
+    controlApiUrl: apiCoordinator?.state.port !== undefined
+      ? `http://localhost:${apiCoordinator.state.port}/api/`
       : undefined,
     screenshotEmpty: screenshotWouldBeBlank()
   });

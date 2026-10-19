@@ -607,7 +607,7 @@ function renderHtml(screenshotOnly = false): string {
       </div>
       <div class="row control-api-status-row" id="controlApiStatusRow" hidden>
         <span class="name" id="controlApiStatus"></span>
-        <a id="controlApiWebLink" target="_blank" style="margin-left: auto; text-decoration: none; color: var(--vscode-textLink-foreground);" href="#">Open Dashboard ↗</a>
+        <a id="controlApiWebLink" target="_blank" title="Open the API command list" style="margin-left: auto; text-decoration: none; color: var(--vscode-textLink-foreground);" href="#">API</a>
       </div>
     </div>
   </div>
@@ -1492,6 +1492,9 @@ function renderHtml(screenshotOnly = false): string {
       $('controlApiStatus').textContent = api.role === 'host' ? 'Hosting shared API' : 'Connected to shared API';
       if (s.controlApiUrl) {
         $('controlApiWebLink').href = s.controlApiUrl;
+        // Show the address itself (without the scheme) so it can be read and
+        // copied straight from the panel.
+        $('controlApiWebLink').textContent = s.controlApiUrl.replace('http://', '').replace('https://', '');
         $('controlApiWebLink').style.display = '';
       } else {
         $('controlApiWebLink').style.display = 'none';

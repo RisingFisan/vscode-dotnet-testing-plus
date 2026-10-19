@@ -18,16 +18,84 @@ import { log } from './logger';
 const PEER_HEARTBEAT_INTERVAL_MS = 5000;
 const PEER_TTL_MS = 16000;
 
-/** Shown by `main`, which ships the control API without the browser dashboard. */
-const API_ONLY_PAGE = `<!DOCTYPE html>
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Human-readable reference for the control API. `main` ships the API without
+ * the browser dashboard, so the webview links here instead.
+ */
+function apiCommandsPage(sessions: HubSession[]): string {
+  const rows: Array<[string, string, string]> = [
+    ['GET', '/api/sessions', 'Open sessions and their solutions'],
+    ['GET', '/api/<session>/state', 'Solutions, active solution and run state'],
+    ['GET', '/api/<session>/events', 'Server-Sent Events: state, testState, runStart, runEnd'],
+    ['GET', '/api/<session>/log?lines=200', 'Recent extension log lines'],
+    ['POST', '/api/<session>/run', 'Run tests: {"fqns":[...]} or {"all":true}'],
+    ['POST', '/api/<session>/cancel', 'Cancel the active run or discovery'],
+    ['POST', '/api/<session>/filter', 'Set the VS Code text filter'],
+    ['POST', '/api/<session>/screenshot', 'Screenshot snapshot for explicit fqns'],
+    ['GET', '/api/<session>/<solution>/tests', 'All discovered tests and their states'],
+    ['GET', '/api/<session>/<solution>/code?fqn=...', 'Source of a test method'],
+    ['POST', '/api/<session>/<solution>/playlist', 'Select or clear a .playlist'],
+    ['POST', '/api/<session>/<solution>/select', 'Switch the active solution'],
+    ['GET', '/api/<session>/<solution>/runsettings', 'Read the runsettings state'],
+    ['POST', '/api/<session>/<solution>/runsettings', 'Apply one runsettings change']
+  ];
+  const table = rows
+    .map(([method, endpoint, purpose]) =>
+      `<tr><td><code>${method}</code></td><td><code>${escapeHtml(endpoint)}</code></td><td>${purpose}</td></tr>`)
+    .join('\n');
+  const sessionItems = sessions.length === 0
+    ? '<li class="muted">No session currently has the API enabled.</li>'
+    : sessions.map(session => {
+        const solutions = session.solutions.length === 0
+          ? '<span class="muted">no solutions loaded</span>'
+          : session.solutions.map(solution => `<code>${escapeHtml(solution.id)}</code>`).join(', ');
+        return `<li><code>${escapeHtml(session.id)}</code> — solutions: ${solutions}</li>`;
+      }).join('\n');
+
+  return `<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>.NET Testing+ — API</title></head>
-<body style="margin:0;padding:32px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;">
-  <h1 style="font-size:18px;margin:0 0 8px;">.NET Testing+ control API</h1>
-  <p style="margin:0 0 8px;">The browser dashboard is not part of this build.</p>
-  <p style="margin:0;color:#8b949e;">Use <code>GET /api/sessions</code>, or switch to the <code>feat/web-ui</code> branch for the dashboard.</p>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>.NET Testing+ — API</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 32px; background: #0d1117; color: #c9d1d9; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    h1 { font-size: 18px; margin: 0 0 6px; }
+    h2 { font-size: 14px; margin: 26px 0 8px; }
+    p { color: #8b949e; margin: 0 0 18px; max-width: 980px; }
+    table { border-collapse: collapse; width: 100%; max-width: 980px; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #30363d; vertical-align: top; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #58a6ff; }
+    ul { margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.7; }
+    .muted { color: #8b949e; }
+  </style>
+</head>
+<body>
+  <h1>.NET Testing+ control API</h1>
+  <p>Every non-UI request uses the <code>/api</code> prefix. Replace <code>&lt;session&gt;</code> and <code>&lt;solution&gt;</code> with the ids listed below. When a token is configured, send <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+  <table>
+    <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+    <tbody>
+${table}
+    </tbody>
+  </table>
+  <h2>Open sessions</h2>
+  <ul>
+${sessionItems}
+  </ul>
 </body>
 </html>`;
+}
 
 export interface ApiRegistryEntry {
   pid: number;
@@ -243,6 +311,12 @@ async function handleHubRequest(req: http.IncomingMessage, res: http.ServerRespo
       return;
     }
 
+    // Human-readable command reference, linked from the VS Code webview.
+    if ((pathname === '/api' || pathname === '/api/') && req.method === 'GET') {
+      sendHtml(res, 200, apiCommandsPage(ctx.sessionsList()));
+      return;
+    }
+
     const api = parseApiPath(pathname);
     if (api) {
       if (!isAuthorized(req, ctx.options.token, url)) {
@@ -258,10 +332,10 @@ async function handleHubRequest(req: http.IncomingMessage, res: http.ServerRespo
     }
 
     // This build ships the API only; the browser dashboard lives on the
-    // `feat/web-ui` branch. Keep the page routes alive with a short notice so
-    // existing links never look like a broken server.
+    // `feat/web-ui` branch. Serve the command reference for the root and old
+    // session links so no link looks like a broken server.
     if ((pathname === '/' || pathname === '/index.html' || /^\/[^/]+\/?$/.test(pathname)) && req.method === 'GET') {
-      sendHtml(res, 200, API_ONLY_PAGE);
+      sendHtml(res, 200, apiCommandsPage(ctx.sessionsList()));
       return;
     }
 
