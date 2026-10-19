@@ -106,6 +106,9 @@ export async function buildMethodIndex(
   // the stat/read/fold entirely.
   const seen = new Set<string>();
   const scannedRoots: string[] = [];
+  // Directories already listed by an earlier project root; nested or
+  // overlapping project directories would otherwise re-walk entire subtrees.
+  const visitedDirs = new Set<string>();
 
   const loadFile = async (file: string): Promise<LoadedFile | undefined> => {
     let stat: fs.Stats;
@@ -130,7 +133,7 @@ export async function buildMethodIndex(
     let files: string[];
     try {
       // Async + chunked so a large solution does not block the extension host.
-      files = await walkCsFilesAsync(root);
+      files = await walkCsFilesAsync(root, true, visitedDirs);
     } catch {
       continue;
     }

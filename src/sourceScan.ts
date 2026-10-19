@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { foldMethods, ExtractedMethod } from './fileScanCache';
-import { TEST_ATTRIBUTES, mayContainTests } from './testAttributes';
+import { ExtractedMethod } from './fileScanCache';
+import { TEST_ATTRIBUTES } from './testAttributes';
 
 const SKIP_DIRS = new Set(['bin', 'obj', 'node_modules', '.git']);
 
@@ -25,31 +25,25 @@ function isSkippedDir(name: string): boolean {
 }
 
 /**
- * Synchronous listing of every .cs file under `dir`, in readdir order. Uses a
- * shared accumulator (spreading each subdirectory's array copied the results
- * once per tree level and could exceed the argument limit on huge trees).
+ * Async listing of every .cs file under `dir`, in readdir order: each entry
+ * maps to its own file-or-subtree list and the lists are flattened back in
+ * entry order, so the first-wins fold contract keeps seeing exactly the
+ * order a sequential depth-first walk produced. Subdirectories are read
+ * concurrently — one awaited readdir at a time is what dominates scan time
+ * on this filesystem — and the awaits yield to the event loop so a big
+ * solution scan does not freeze the shared extension host. Throws if `dir`
+ * itself cannot be read; unreadable subdirectories are skipped (like files
+ * that disappear mid-scan). `visited`, shared across calls, lets overlapping
+ * project roots skip re-walking subtrees an earlier root already listed.
  */
-export function walkCsFiles(dir: string, files: string[] = []): string[] {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (!isSkippedDir(entry.name)) {
-        walkCsFiles(full, files);
-      }
-    } else if (/\.cs$/i.test(entry.name)) {
-      files.push(full);
-    }
+export async function walkCsFilesAsync(
+  dir: string,
+  isRoot = true,
+  visited?: Set<string>
+): Promise<string[]> {
+  if (visited?.has(dir)) {
+    return [];
   }
-  return files;
-}
-
-/**
- * Same listing and order as {@link walkCsFiles}, but yields to the event loop
- * on every directory so a big solution scan does not freeze the shared
- * extension host. Throws if `dir` itself cannot be read; unreadable
- * subdirectories are skipped (like files that disappear mid-scan).
- */
-export async function walkCsFilesAsync(dir: string, files: string[] = [], isRoot = true): Promise<string[]> {
   let entries: fs.Dirent[];
   try {
     entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -57,35 +51,29 @@ export async function walkCsFilesAsync(dir: string, files: string[] = [], isRoot
     if (isRoot) {
       throw err;
     }
-    return files;
+    return [];
   }
-  for (const entry of entries) {
+  visited?.add(dir);
+  const listings = await Promise.all(entries.map(async entry => {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (!isSkippedDir(entry.name)) {
-        await walkCsFilesAsync(full, files, false);
-      }
-    } else if (/\.cs$/i.test(entry.name)) {
-      files.push(full);
+      return isSkippedDir(entry.name) ? [] : walkCsFilesAsync(full, false, visited);
     }
-  }
-  return files;
+    return /\.cs$/i.test(entry.name) ? [full] : [];
+  }));
+  return listings.flat();
 }
+
 export interface SourceLocation {
   file: string;
   line: number; // 1-based; convert to 0-based Range when used
 }
 
-export interface MethodIndexResult {
-  /** bare method name -> fully-qualified names */
-  methodIndex: Map<string, Set<string>>;
-  /** fully-qualified name -> source file + line */
-  locations: Map<string, SourceLocation>;
-  /** fully-qualified name -> owning csproj path */
-  projects: Map<string, string>;
-}
-
 export function extractMethodsRegex(content: string): ExtractedMethod[] {
+  // Limitation: NAMESPACE_RE is non-global, so every class in the file is
+  // attributed to the first block namespace; a file with several block
+  // namespaces mis-names the later classes. (The AST scanner resolves each
+  // class's real namespace.)
   const nsMatch = NAMESPACE_RE.exec(content);
   if (!nsMatch) {
     return [];
@@ -93,6 +81,12 @@ export function extractMethodsRegex(content: string): ExtractedMethod[] {
   const ns = nsMatch[1].replace(/;$/, '');
 
   const methods: ExtractedMethod[] = [];
+  // matchAll yields matches in ascending index order — within a class body,
+  // and across classes because the bodies are consecutive slices of the
+  // file — so one running newline count replaces the per-method
+  // slice/split, which was quadratic on files with many test methods.
+  let nextNewline = content.indexOf('\n');
+  let newlinesBefore = 0;
   const classMatches = [...content.matchAll(CLASS_RE)];
   for (let i = 0; i < classMatches.length; i++) {
     const className = classMatches[i][1];
@@ -109,44 +103,13 @@ export function extractMethodsRegex(content: string): ExtractedMethod[] {
       const parenIdx = matchText.lastIndexOf('(');
       const nameIdx = parenIdx >= 0 ? matchText.lastIndexOf(method, parenIdx) : matchText.lastIndexOf(method);
       const methodIndexInFile = start + (m.index ?? 0) + Math.max(nameIdx, 0);
-      const line = content.slice(0, methodIndexInFile).split('\n').length;
+      while (nextNewline >= 0 && nextNewline < methodIndexInFile) {
+        newlinesBefore++;
+        nextNewline = content.indexOf('\n', nextNewline + 1);
+      }
+      const line = newlinesBefore + 1;
       methods.push({ bare: method, fullyQualifiedName: `${ns}.${className}.${method}`, line });
     }
   }
   return methods;
-}
-
-/**
- * Regex-based scanner fallback (used by harnesses and by anyone calling the
- * old API directly). The runtime fallback path in astScan.ts runs the same
- * extractor through the incremental driver, so it also benefits from the
- * per-file scan cache.
- */
-export function buildMethodIndex(projectPaths: string[]): MethodIndexResult {
-  const methodIndex = new Map<string, Set<string>>();
-  const locations = new Map<string, SourceLocation>();
-  const projects = new Map<string, string>();
-
-  for (const csprojPath of projectPaths) {
-    let files: string[];
-    try {
-      files = walkCsFiles(path.dirname(csprojPath));
-    } catch {
-      continue;
-    }
-    for (const file of files) {
-      let content: string;
-      try {
-        content = fs.readFileSync(file, 'utf8');
-      } catch {
-        continue;
-      }
-      if (!mayContainTests(content)) {
-        continue;
-      }
-      foldMethods(extractMethodsRegex(content), file, csprojPath, methodIndex, locations, projects);
-    }
-  }
-
-  return { methodIndex, locations, projects };
 }

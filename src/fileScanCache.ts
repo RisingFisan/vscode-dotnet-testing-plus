@@ -89,6 +89,23 @@ interface StorageEntry {
 }
 
 /**
+ * Element-wise equality of the stored tuples (stringifying both arrays was
+ * pure allocation overhead). A corrupt cache entry (missing or non-array
+ * `t`, non-tuple elements) simply reports unequal so the entry gets
+ * rewritten instead of throwing.
+ */
+function sameMethods(before: [string, string, number][] | undefined, after: [string, string, number][]): boolean {
+  if (!Array.isArray(before) || before.length !== after.length) {
+    return false;
+  }
+  return before.every((tuple, index) =>
+    Array.isArray(tuple) &&
+    tuple[0] === after[index][0] &&
+    tuple[1] === after[index][1] &&
+    tuple[2] === after[index][2]);
+}
+
+/**
  * Scan cache keyed by absolute file path. An entry is valid as long as the
  * file's mtime and size are unchanged and the scanner version matches;
  * extraction logic changes must bump the version so every entry invalidates
@@ -102,6 +119,10 @@ export class FileScanCache {
   private data: Record<string, StorageEntry> = {};
   private readonly file: string | undefined;
   private readonly engineFile: string | undefined;
+  // Materialized views of each entry's tuples, keyed by entry object — a
+  // WeakMap (rather than a field on the entry) keeps the persisted JSON free
+  // of the duplicate form.
+  private readonly materialized = new WeakMap<StorageEntry, ExtractedMethod[]>();
   private dirty = false;
 
   constructor(storageDir: string | undefined) {
@@ -124,7 +145,16 @@ export class FileScanCache {
     if (!entry || entry.m !== mtimeMs || entry.s !== size || entry.v !== version || !Array.isArray(entry.t)) {
       return undefined;
     }
-    return entry.t.map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
+    // Materialize once per entry — a fully-cached reload hits this for
+    // every unchanged file — and share the result; callers must treat it
+    // as read-only.
+    const cached = this.materialized.get(entry);
+    if (cached) {
+      return cached;
+    }
+    const methods = entry.t.map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
+    this.materialized.set(entry, methods);
+    return methods;
   }
 
   set(file: string, mtimeMs: number, size: number, version: string, methods: readonly ExtractedMethod[]): void {
@@ -142,7 +172,7 @@ export class FileScanCache {
       before.m !== stored.m ||
       before.s !== stored.s ||
       before.v !== stored.v ||
-      JSON.stringify(before.t) !== JSON.stringify(stored.t)
+      !sameMethods(before.t, stored.t)
     ) {
       this.data[file] = stored;
       this.dirty = true;
