@@ -2,7 +2,7 @@
   "name": "dotnet-testing-plus",
   "displayName": ".NET Testing+",
   "description": "Filter, run, and debug tests from .NET solutions using Visual Studio playlists, advanced filters, and runsettings.",
-  "version": "1.21.3",
+  "version": "1.24.0",
   "icon": "assets/icon.png",
   "publisher": "RisingFisan",
   "license": "GPL-3.0-only",
@@ -49,14 +49,14 @@
         "dotnetTestingPlus.controlApiEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable or disable the local JSON HTTP control API for external agents and tools."
+          "description": "Enable or disable the shared local JSON HTTP control API for external agents and tools. All VS Code windows with the API enabled share one API; the first window hosts it and the others join."
         },
         "dotnetTestingPlus.controlApiPort": {
           "type": "number",
           "default": 48265,
           "minimum": 0,
           "maximum": 65535,
-          "description": "Port for the local JSON control API (default: 48265). Enabling the API is controlled by 'dotnetTestingPlus.controlApiEnabled'. The API binds to 127.0.0.1 inside the extension host and exposes extension state plus run controls for external tools such as OpenCode."
+          "description": "Port for the shared JSON control API (default: 48265). Only the window that hosts the API uses this value; other windows discover the host automatically. The setting is usually best set at the user level so every window agrees."
         },
         "dotnetTestingPlus.controlApiToken": {
           "type": "string",

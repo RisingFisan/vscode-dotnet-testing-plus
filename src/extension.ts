@@ -16,11 +16,13 @@ import { SourceLocation } from './sourceScan';
 import { buildMethodIndex } from './astScan';
 import { buildSolutionPlaceholder, buildSolutionTree, testItemId, updateGroupLabels } from './testTree';
 import { initLogger, showLog, log, recentLogLines } from './logger';
-import { startControlApi, ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiState, ControlApiTest } from './controlApi';
+import { ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiRunsettingsAction, ControlApiState, ControlApiSseEvent, ControlApiTest } from './controlApi';
+import { ApiCoordinator } from './apiCoordinator';
+import { assignUniqueId, deriveSessionBaseId, solutionIdFromPath } from './apiIds';
 import { MainViewProvider, MainViewAction, ScreenshotExportSettings } from './mainView';
 import { TestFilter, parseTestFilter, filterEntries } from './testFilter';
 import { TestResultFilter, TestResultFilterKey, TestResultState, createDefaultTestResultFilter, isTestResultVisible } from './testResultFilter';
-import { buildScreenshotSnapshot, ScreenshotOptions } from './screenshot';
+import { buildScreenshotSnapshot, ScreenshotOptions, ScreenshotSessionData, ScreenshotSnapshot } from './screenshot';
 import { installAgentSkill } from './skillInstaller';
 import {
   findDefaultRunsettings,
@@ -73,6 +75,8 @@ interface SolutionSession {
   permanentRunsettings: PermanentRunsettingsConfig;
   activeFilter?: TestFilter;
   testResultFilter: TestResultFilter;
+  /** Bumped whenever the result filter changes; it is mutated in place, so identity cannot detect changes. */
+  resultFilterVersion: number;
   testResultStates: Map<string, TestResultState>;
   testDurations: Map<string, number>;
   discoveryCts?: vscode.CancellationTokenSource;
@@ -85,6 +89,9 @@ interface SolutionSession {
   playlistReloadTimer?: NodeJS.Timeout;
   runsettingsWatcher?: fs.FSWatcher;
   runsettingsReloadTimer?: NodeJS.Timeout;
+  /** Next re-arm delay for a failing playlist/runsettings watcher (exponential backoff; undefined = no backoff in progress). */
+  playlistWatchRetryMs?: number;
+  runsettingsWatchRetryMs?: number;
   treeRoot?: vscode.TestItem;
   treeDirty: boolean;
   /** Bumped on every result-state change; invalidates cached visible entries while a result filter hides anything. */
@@ -95,7 +102,7 @@ interface SolutionSession {
   visibleEntries?: {
     base: PlaylistTest[];
     filter: TestFilter | undefined;
-    filterSignature: string;
+    resultFilterVersion: number;
     statesVersion: number;
     entries: PlaylistTest[];
   };
@@ -113,15 +120,18 @@ let searchAllSolutions = false;
 const activeRuns = new Set<vscode.CancellationTokenSource>();
 // Solutions with a run in flight: a second run on the same solution is refused.
 const runningSolutions = new Set<string>();
-let controlApi: vscode.Disposable | undefined;
-let controlApiRunningPort: number | undefined;
+let apiCoordinator: ApiCoordinator | undefined;
+// Serialized payload of the last SSE state broadcast; identical states skip the broadcast.
+let lastBroadcastState: string | undefined;
+// Solution inventory signature last pushed to the hub / peer registry.
+let lastSolutionsSignature: string | undefined;
 let controlApiSessionEnabled = false;
 let codeLenses: CodeLensHandle | undefined;
 const failureLocations = new Map<string, TestFailureLocations>();
 
 export function activate(context: vscode.ExtensionContext): void {
   initLogger();
-  log('Extension activated (v1.21.3, multi-solution discovery)');
+  log('Extension activated (v1.24.0, multi-solution discovery)');
   extensionContext = context;
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
@@ -213,7 +223,12 @@ export function activate(context: vscode.ExtensionContext): void {
         syncControlApi(context);
       }
     }),
-    new vscode.Disposable(() => controlApi?.dispose())
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      // The session id comes from the first workspace folder; re-register so
+      // other windows see the new name.
+      syncControlApi(context);
+    }),
+    new vscode.Disposable(() => apiCoordinator?.stop())
   );
   codeLenses = registerCodeLenses(() => [...sessions.values()]);
   context.subscriptions.push(codeLenses);
@@ -251,6 +266,7 @@ function createSession(saved: PersistedSession): SolutionSession {
     customRunsettings,
     permanentRunsettings,
     testResultFilter: createDefaultTestResultFilter(),
+    resultFilterVersion: 0,
     testResultStates: new Map(),
     testDurations: new Map(),
     testLocations: new Map(),
@@ -459,7 +475,12 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
       extensionContext?.globalStorageUri.fsPath
     );
     if (cts.token.isCancellationRequested) {
-      throw new Error('Discovery cancelled');
+      // Same cleanup the catch performs for cancellation, without using an
+      // exception as control flow.
+      session.discoveredCount = undefined;
+      session.message = 'Solution loading stopped';
+      session.treeDirty = true;
+      return;
     }
     session.testLocations = locations;
     session.testProjects = projects;
@@ -507,7 +528,9 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
       matchPlaylist(session, true);
     }
   } catch (err) {
-    session.knownTests = undefined;
+    // A transient dotnet failure during a refresh must not destroy an
+    // already-loaded tree; only a first load (no tests yet) has nothing to
+    // keep, and the error is surfaced below either way.
     session.discoveredCount = undefined;
     session.message = cts.token.isCancellationRequested
       ? 'Solution loading stopped'
@@ -540,11 +563,10 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
         ? expandPlaylist(session.playlist, session.knownTests, fqn => session.testProjects.get(fqn))
         : { entries: [], notFound: [] };
       session.playlistExpansion = { knownTests: session.knownTests, entries: expansion.entries, notFound: expansion.notFound };
+      session.notFoundTests = expansion.notFound;
     }
-    session.notFoundTests = session.playlistExpansion.notFound;
     base = session.playlistExpansion.entries;
   } else {
-    session.notFoundTests = [];
     // Building an entry per known test is O(N); reuse it until the discovered
     // tests or their project mapping change.
     if (
@@ -557,6 +579,7 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
         entries.push(entryFromKnownTestFqn(fqn, session.testProjects.get(fqn)));
       }
       session.baseEntries = { known: session.knownTests, projects: session.testProjects, entries };
+      session.notFoundTests = [];
     }
     base = session.baseEntries.entries;
   }
@@ -564,7 +587,7 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
   // screenshot checks). Reuse the filtered result while none of its inputs
   // changed. Result states only matter when the result filter hides something.
   const resultFilter = session.testResultFilter;
-  const filterSignature = JSON.stringify(resultFilter);
+  const resultFilterVersion = session.resultFilterVersion;
   const statesMatter = !(resultFilter.passing && resultFilter.failing && resultFilter.notRun && resultFilter.skipped);
   const statesVersion = statesMatter ? session.statesVersion : -1;
   const cached = session.visibleEntries;
@@ -572,14 +595,14 @@ function entriesForSession(session: SolutionSession): PlaylistTest[] {
     cached &&
     cached.base === base &&
     cached.filter === session.activeFilter &&
-    cached.filterSignature === filterSignature &&
+    cached.resultFilterVersion === resultFilterVersion &&
     cached.statesVersion === statesVersion
   ) {
     return cached.entries;
   }
   const entries = filterEntries(base, session.activeFilter)
     .filter(entry => isTestResultVisible(resultFilter, session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun'));
-  session.visibleEntries = { base, filter: session.activeFilter, filterSignature, statesVersion, entries };
+  session.visibleEntries = { base, filter: session.activeFilter, resultFilterVersion, statesVersion, entries };
   return entries;
 }
 
@@ -670,6 +693,7 @@ async function runWithSolutions(
   const forwardCancel = token.onCancellationRequested(() => runCts.cancel());
   activeRuns.add(runCts);
   requestedSolutions.forEach(solutionPath => runningSolutions.add(solutionPath));
+  apiCoordinator?.broadcast(ControlApiSseEvent.RunStart, { solutions: [...requestedSolutions] });
   try {
     await executeSolutionRun(request, runCts.token, debug, descriptors, requestedSolutions);
   } finally {
@@ -677,6 +701,7 @@ async function runWithSolutions(
     activeRuns.delete(runCts);
     requestedSolutions.forEach(solutionPath => runningSolutions.delete(solutionPath));
     runCts.dispose();
+    apiCoordinator?.broadcast(ControlApiSseEvent.RunEnd, controlApiState());
   }
 }
 
@@ -806,6 +831,12 @@ async function executeSolutionRun(
         } else {
           session.testDurations.set(descriptor.fullyQualifiedName, durationMs);
         }
+        apiCoordinator?.broadcast(ControlApiSseEvent.TestState, {
+          solutionPath: descriptor.solutionPath,
+          fqn: descriptor.fullyQualifiedName,
+          state,
+          durationMs
+        });
         if (state === 'passed' || state === 'failed' || state === 'skipped') {
           if (lastScreenshotBlank) {
             const blank = screenshotWouldBeBlank();
@@ -964,10 +995,13 @@ function controlApiState(): ControlApiState {
       resultCounts[state] = (resultCounts[state] ?? 0) + 1;
     }
   }
+  const ids = apiSolutionIds();
   return {
-    apiVersion: 1,
-    activeSessionKey,
-    sessions: [...sessions.values()].map(item => ({
+    apiVersion: 2,
+    sessionId: apiCoordinator?.getSessionId() ?? '',
+    activeSolutionKey: activeSessionKey,
+    solutions: [...sessions.values()].map(item => ({
+      id: ids.get(item.key) ?? solutionIdFromPath(item.solutionPath),
       key: item.key,
       label: path.basename(item.solutionPath, path.extname(item.solutionPath)),
       solutionPath: item.solutionPath,
@@ -988,67 +1022,103 @@ function controlApiState(): ControlApiState {
   };
 }
 
-function controlApiTests(solutionKey?: string): ControlApiTest[] {
-  const targets: SolutionSession[] = [];
-  if (solutionKey) {
-    const session = sessions.get(solutionKey);
-    if (!session) {
-      throw new ControlApiError(404, `Unknown solution key: ${solutionKey}`);
-    }
-    targets.push(session);
-  } else {
-    targets.push(...sessions.values());
+/** Stable, unique per-window URL ids for every loaded solution (sorted for determinism). */
+function apiSolutionIds(): Map<string, string> {
+  const ids = new Map<string, string>();
+  const taken = new Set<string>();
+  for (const key of [...sessions.keys()].sort()) {
+    const id = assignUniqueId(solutionIdFromPath(key), taken);
+    ids.set(key, id);
+    taken.add(id);
   }
-  const tests: ControlApiTest[] = [];
-  for (const session of targets) {
-    for (const entry of entriesForSession(session)) {
-      const fqn = entry.fullyQualifiedName;
-      const lastDot = fqn.lastIndexOf('.');
-      const location = session.testLocations.get(fqn);
-      const duration = session.testDurations.get(fqn);
-      tests.push({
-        solutionPath: session.solutionPath,
-        project: session.testProjects.get(fqn),
-        fqn,
-        name: lastDot === -1 ? fqn : fqn.slice(lastDot + 1),
-        class: lastDot === -1 ? undefined : fqn.slice(0, lastDot),
-        state: session.testResultStates.get(fqn) ?? 'notRun',
-        durationMs: duration,
-        file: location?.file,
-        line: location?.line
-      });
+  return ids;
+}
+
+function solutionKeyFromId(id: string): string | undefined {
+  for (const [key, value] of apiSolutionIds()) {
+    if (value === id) {
+      return key;
     }
+  }
+  return undefined;
+}
+
+function resolveApiSolution(id: string): SolutionSession {
+  const key = solutionKeyFromId(id);
+  const session = key ? sessions.get(key) : undefined;
+  if (!session) {
+    throw new ControlApiError(404, `Unknown solution: ${id}`);
+  }
+  return session;
+}
+
+function controlApiTests(solutionId: string): ControlApiTest[] {
+  const session = resolveApiSolution(solutionId);
+  const tests: ControlApiTest[] = [];
+  if (!session.knownTests) {
+    return tests;
+  }
+  // Every known test is reported regardless of the VS Code playlist / text /
+  // result filters: the dashboard owns its own scoping. Only result *states*
+  // (which are shared, being actual run output) cross the boundary.
+  for (const fqn of session.knownTests) {
+    const entry = entryFromKnownTestFqn(fqn, session.testProjects.get(fqn));
+    const location = session.testLocations.get(fqn);
+    const duration = session.testDurations.get(fqn);
+    tests.push({
+      solutionPath: session.solutionPath,
+      solutionId,
+      project: entry.project,
+      fqn,
+      name: entry.testName,
+      class: entry.className,
+      state: session.testResultStates.get(fqn) ?? 'notRun',
+      durationMs: duration,
+      file: location?.file,
+      line: location?.line
+    });
   }
   return tests;
 }
 
 async function runApiTests(options: ControlApiRunOptions): Promise<ControlApiRunResult> {
   const debug = options.debug ?? false;
-  if (options.solution && !sessions.has(options.solution)) {
-    throw new ControlApiError(404, `Unknown solution key: ${options.solution}`);
+  const solutionKey = options.solution ? (solutionKeyFromId(options.solution) ?? undefined) : undefined;
+  if (options.solution && !solutionKey) {
+    throw new ControlApiError(404, `Unknown solution: ${options.solution}`);
   }
   // Built once and shared with the run itself (it used to be built twice).
   const descriptors = collectDescriptors();
   const leaves: vscode.TestItem[] = [];
   const missing: string[] = [];
   if (Array.isArray(options.fqns) && options.fqns.length > 0) {
-    const wanted = new Map<string, string>();
+    const wanted = new Map<string, { fqn: string; session: SolutionSession }>();
     for (const fqn of options.fqns) {
-      const session = options.solution
-        ? sessions.get(options.solution)
+      const session = solutionKey
+        ? sessions.get(solutionKey)
         : [...sessions.values()].find(item => item.knownTests?.has(fqn));
       if (session?.knownTests !== undefined && session.knownTests.has(fqn)) {
-        wanted.set(fqn, testItemId(session.solutionPath, fqn));
+        wanted.set(fqn, { fqn, session });
       }
     }
     const visible = new Map(collectLeafItems(undefined, descriptors).map(item => [item.id, item] as const));
     const missingSet = new Set<string>();
-    for (const [fqn, id] of wanted) {
+    for (const [fqn, { session }] of wanted) {
+      const id = testItemId(session.solutionPath, fqn);
       const item = visible.get(id);
       if (item) {
         leaves.push(item);
       } else {
-        missingSet.add(fqn);
+        const location = session.testLocations.get(fqn);
+        const uri = location?.file ? vscode.Uri.file(location.file) : undefined;
+        const leaf = controller.createTestItem(id, fqn, uri);
+        descriptors.set(id, {
+          fullyQualifiedName: fqn,
+          solutionPath: session.solutionPath,
+          projectPath: session.testProjects.get(fqn),
+          location
+        });
+        leaves.push(leaf);
       }
     }
     for (const fqn of options.fqns) {
@@ -1058,7 +1128,7 @@ async function runApiTests(options: ControlApiRunOptions): Promise<ControlApiRun
     }
     missing.push(...missingSet);
   } else if (options.all) {
-    const scope = options.solution ? sessions.get(options.solution)?.treeRoot : undefined;
+    const scope = solutionKey ? sessions.get(solutionKey)?.treeRoot : undefined;
     leaves.push(...collectLeafItems(scope, descriptors));
   } else {
     throw new ControlApiError(400, 'Provide "all": true or a non-empty "fqns" array.');
@@ -1097,10 +1167,10 @@ function cancelApiRun(options: { loading?: boolean }): { cancelled: boolean; can
 
 async function setApiPlaylist(
   context: vscode.ExtensionContext,
-  solutionKey: string | undefined,
+  solutionId: string,
   playlistPath: string | undefined
 ): Promise<{ matched: number; notFound: number }> {
-  const session = solutionKey ? sessions.get(solutionKey) : activeSession();
+  const session = resolveApiSolution(solutionId);
   if (!session) {
     throw new ControlApiError(404, 'No matching loaded solution.');
   }
@@ -1118,43 +1188,161 @@ async function setApiPlaylist(
   return { matched: entriesForSession(session).length, notFound: session.notFoundTests.length };
 }
 
+function extractMethodSource(filePath: string, line: number): string {
+  if (!fs.existsSync(filePath)) {
+    return '// Source file not found: ' + filePath;
+  }
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split(/\r?\n/);
+  const declIndex = Math.max(0, Math.min(lines.length - 1, line - 1));
+
+  let startIndex = declIndex;
+  while (startIndex > 0) {
+    const prev = lines[startIndex - 1].trim();
+    if (prev.startsWith('[') || prev.startsWith('//') || prev.startsWith('/*') || prev.startsWith('*')) {
+      startIndex--;
+    } else {
+      break;
+    }
+  }
+
+  let openBraceFound = false;
+  let braceDepth = 0;
+  let endIndex = declIndex;
+  // Braces inside string literals, char literals and comments must not count:
+  // a body containing Console.WriteLine("}") or "// }" would otherwise
+  // truncate the extraction.
+  let inBlockComment = false;
+
+  for (let i = declIndex; i < lines.length; i++) {
+    const l = lines[i];
+    for (let c = 0; c < l.length; c++) {
+      const ch = l[c];
+      if (inBlockComment) {
+        if (ch === '*' && l[c + 1] === '/') {
+          inBlockComment = false;
+          c++;
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        // Skip the quoted run; a backslash escapes the next character.
+        const quote = ch;
+        c++;
+        while (c < l.length && l[c] !== quote) {
+          if (l[c] === '\\') {
+            c++;
+          }
+          c++;
+        }
+        continue;
+      }
+      if (ch === '/' && l[c + 1] === '/') {
+        break;
+      }
+      if (ch === '/' && l[c + 1] === '*') {
+        inBlockComment = true;
+        c++;
+        continue;
+      }
+      if (ch === '{') {
+        openBraceFound = true;
+        braceDepth++;
+      } else if (ch === '}') {
+        braceDepth--;
+        if (openBraceFound && braceDepth <= 0) {
+          endIndex = i;
+          break;
+        }
+      } else if (!openBraceFound && ch === ';' && l.includes('=>')) {
+        endIndex = i;
+        break;
+      }
+    }
+    if (openBraceFound && braceDepth <= 0) {
+      break;
+    }
+  }
+
+  if (!openBraceFound && endIndex === declIndex) {
+    endIndex = Math.min(lines.length - 1, declIndex + 30);
+  }
+
+  return lines.slice(startIndex, endIndex + 1).join('\n');
+}
+
 function controlApiHandlers(context: vscode.ExtensionContext): ControlApiHandlers {
   return {
     getState: () => controlApiState(),
-    getTests: solutionKey => ({ tests: controlApiTests(solutionKey) }),
+    getTests: solutionId => ({ tests: controlApiTests(solutionId) }),
     runTests: options => runApiTests(options),
     cancelRun: options => cancelApiRun(options),
-    setPlaylist: (solutionKey, playlistPath) => setApiPlaylist(context, solutionKey, playlistPath),
+    setPlaylist: (solutionId, playlistPath) => setApiPlaylist(context, solutionId, playlistPath),
     setFilter: text => applyFilterInput(text),
-    selectSession: async key => {
-      if (!sessions.has(key)) {
+    selectSolution: async solutionId => {
+      const key = solutionKeyFromId(solutionId);
+      if (!key) {
         return false;
       }
       await selectSession(context, key);
       return true;
     },
-    logLines: limit => recentLogLines(limit)
+    logLines: limit => recentLogLines(limit),
+    getScreenshot: settings => apiScreenshotSnapshot(settings),
+    getCode: (solutionId, fqn) => {
+      const session = resolveApiSolution(solutionId);
+      const location = session.testLocations.get(fqn);
+      if (!location) {
+        return { fqn, code: '// Source location not available for ' + fqn };
+      }
+      const code = extractMethodSource(location.file, location.line);
+      return {
+        fqn,
+        file: location.file,
+        line: location.line,
+        code
+      };
+    },
+    getRunsettings: solutionId => apiRunsettings(resolveApiSolution(solutionId)),
+    applyRunsettings: (solutionId, action) => apiApplyRunsettings(context, resolveApiSolution(solutionId), action)
   };
+}
+
+function apiSessionBase(): { baseId: string; label: string } {
+  const folders = vscode.workspace.workspaceFolders;
+  const workspaceFile = vscode.workspace.workspaceFile;
+  const label = folders && folders.length > 0
+    ? folders[0].name
+    : (workspaceFile ? path.basename(workspaceFile.fsPath, path.extname(workspaceFile.fsPath)) : 'untitled');
+  const baseId = deriveSessionBaseId(
+    workspaceFile ? { fsPath: workspaceFile.fsPath } : undefined,
+    folders?.map(folder => ({ name: folder.name }))
+  );
+  return { baseId, label };
 }
 
 function syncControlApi(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration('dotnetTestingPlus');
-  const enabled = controlApiSessionEnabled;
+  const enabled = controlApiSessionEnabled || config.get<boolean>('controlApiEnabled', false);
   const port = config.get<number>('controlApiPort', 48265);
-  controlApi?.dispose();
-  controlApi = undefined;
-  controlApiRunningPort = undefined;
+  const token = config.get<string>('controlApiToken', '') ?? '';
+  apiCoordinator?.stop();
+  apiCoordinator = undefined;
+  lastBroadcastState = undefined;
+  lastSolutionsSignature = undefined;
   void updateViewState();
-  if (enabled && port > 0) {
-    controlApi = startControlApi(
-      port,
-      config.get<string>('controlApiToken', '') ?? '',
-      controlApiHandlers(context),
-      boundPort => {
-        controlApiRunningPort = boundPort;
-        void updateViewState();
-      }
-    );
+  if (enabled) {
+    const coordinator = new ApiCoordinator({
+      globalStorageDir: context.globalStorageUri.fsPath,
+      handlers: controlApiHandlers(context),
+      getPort: () => port,
+      getToken: () => token,
+      getSessionBase: () => apiSessionBase(),
+      getSolutions: () => controlApiState().solutions,
+      onStateChange: () => void updateViewState()
+    });
+    apiCoordinator = coordinator;
+    void coordinator.start();
   }
 }
 
@@ -1190,7 +1378,13 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
     case 'resetCustomRunsettingsValue': await resetCustomRunsettingsValue(context, action.key); break;
     case 'toggleLockCustomRunsettingsValue': await toggleLockCustomRunsettingsValue(context, action.key, action.isPermanent); break;
     case 'addCustomRunsettingsParameter': await addCustomRunsettingsParameter(context); break;
-    case 'updateCustomRunsettingsParameter': await updateCustomRunsettingsParameter(context, action.id, action.field, action.value); break;
+    case 'updateCustomRunsettingsParameter': {
+      const error = await updateCustomRunsettingsParameter(context, action.id, action.field, action.value);
+      if (error) {
+        void vscode.window.showWarningMessage(error);
+      }
+      break;
+    }
     case 'removeCustomRunsettingsParameter': await removeCustomRunsettingsParameter(context, action.id); break;
     case 'toggleLockCustomRunsettingsParameter': await toggleLockCustomRunsettingsParameter(context, action.id, action.isPermanent); break;
   }
@@ -1234,14 +1428,14 @@ function toggleSearchAllSolutions(checked: boolean): void {
 }
 
 function clearSearchFilters(): void {
+  // Mirrors applyFilterInput's scoping: the text filter follows the search
+  // mode, and the result filter is cleared for every session it can gate.
   if (searchAllSolutions) {
     for (const s of sessions.values()) {
       s.activeFilter = undefined;
+      s.testResultFilter = createDefaultTestResultFilter();
+      s.resultFilterVersion++;
       s.treeDirty = true;
-    }
-    const session = activeSession();
-    if (session) {
-      session.testResultFilter = createDefaultTestResultFilter();
     }
   } else {
     const session = activeSession();
@@ -1250,6 +1444,7 @@ function clearSearchFilters(): void {
     }
     session.activeFilter = undefined;
     session.testResultFilter = createDefaultTestResultFilter();
+    session.resultFilterVersion++;
     session.treeDirty = true;
   }
   renderTree();
@@ -1262,6 +1457,7 @@ function applyResultFilter(key: TestResultFilterKey, checked: boolean): void {
     return;
   }
   session.testResultFilter[key] = checked;
+  session.resultFilterVersion++;
   session.treeDirty = true;
   renderTree();
   void updateContexts();
@@ -1314,7 +1510,8 @@ function matchPlaylist(session: SolutionSession, silent = false): void {
     session.playlist = parsePlaylist(fs.readFileSync(session.playlistPath, 'utf8'));
     session.playlistExpansion = undefined;
   } catch (err) {
-    session.notFoundTests = [];
+    // A parse failure leaves the previous playlist and its expansion in place;
+    // only the error is surfaced.
     void vscode.window.showErrorMessage(`Failed to parse playlist: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
@@ -1359,6 +1556,12 @@ function watchFileSafely(file: string, onChange: () => void, rearm: () => void):
   }
 }
 
+// Re-arming a permanently failing fs.watch every 500 ms would spam the log
+// forever; consecutive failures back off exponentially, and a successful
+// re-arm resets the delay.
+const WATCH_RETRY_BASE_MS = 500;
+const WATCH_RETRY_MAX_MS = 30000;
+
 function watchPlaylistFile(session: SolutionSession): void {
   session.playlistWatcher?.close();
   session.playlistWatcher = undefined;
@@ -1380,12 +1583,16 @@ function watchPlaylistFile(session: SolutionSession): void {
       }
     }
   );
-  if (!session.playlistWatcher) {
+  if (session.playlistWatcher) {
+    session.playlistWatchRetryMs = undefined;
+  } else {
+    const retryMs = session.playlistWatchRetryMs ?? WATCH_RETRY_BASE_MS;
+    session.playlistWatchRetryMs = Math.min(retryMs * 2, WATCH_RETRY_MAX_MS);
     setTimeout(() => {
       if (sessions.get(session.key) === session && session.playlistPath === file && !session.playlistWatcher) {
         watchPlaylistFile(session);
       }
-    }, 500);
+    }, retryMs);
   }
 }
 
@@ -1436,10 +1643,10 @@ function requestScreenshotPreview(settings: ScreenshotExportSettings): void {
   mainView.postScreenshotPreview(snapshot);
 }
 
-function screenshotOptions(settings: ScreenshotExportSettings): ScreenshotOptions {
+/** Display options shared by the webview preview and the control API snapshot. */
+function screenshotDisplayOptions(settings: ScreenshotExportSettings): Omit<ScreenshotOptions, 'solutionKeys'> {
   const groupBy = settings.groupBy === 'class' || settings.groupBy === 'test' ? settings.groupBy : 'project';
   return {
-    solutionKeys: Array.isArray(settings.solutionKeys) ? settings.solutionKeys.filter(key => typeof key === 'string') : [],
     groupBy,
     show: {
       passing: settings.show?.passing !== false,
@@ -1452,16 +1659,80 @@ function screenshotOptions(settings: ScreenshotExportSettings): ScreenshotOption
   };
 }
 
+function screenshotOptions(settings: ScreenshotExportSettings): ScreenshotOptions {
+  return {
+    solutionKeys: Array.isArray(settings.solutionKeys) ? settings.solutionKeys.filter(key => typeof key === 'string') : [],
+    ...screenshotDisplayOptions(settings)
+  };
+}
+
+/**
+ * The web dashboard asks for an explicit set of FQNs, so neither the VS Code
+ * playlist/text/result filters nor the active solution tab leak into the export.
+ */
+function apiScreenshotSnapshot(settings: unknown): ScreenshotSnapshot {
+  const body = (settings && typeof settings === 'object' ? settings : {}) as { fqns?: unknown; solutionKeys?: unknown };
+  const wanted = new Set(Array.isArray(body.fqns) ? body.fqns.filter((fqn): fqn is string => typeof fqn === 'string') : []);
+  const keys: string[] = [];
+  const data: ScreenshotSessionData[] = [];
+  for (const session of sessions.values()) {
+    if (!session.knownTests) {
+      continue;
+    }
+    const entries: PlaylistTest[] = [];
+    for (const fqn of session.knownTests) {
+      if (wanted.has(fqn)) {
+        entries.push(entryFromKnownTestFqn(fqn, session.testProjects.get(fqn)));
+      }
+    }
+    if (entries.length === 0) {
+      continue;
+    }
+    keys.push(session.key);
+    data.push({
+      key: session.key,
+      solutionPath: session.solutionPath,
+      entries,
+      states: session.testResultStates,
+      durations: session.testDurations,
+      projects: session.testProjects
+    });
+  }
+  return buildScreenshotSnapshot(data, {
+    ...screenshotDisplayOptions(body as ScreenshotExportSettings),
+    solutionKeys: keys
+  });
+}
+
+// Screenshot blankness is checked on every view refresh but only depends on
+// a session's visible entries and their states; memoize per session so the
+// per-result refreshes during a run skip the full entry scan.
+const screenshotBlankCache = new WeakMap<SolutionSession, { entries: PlaylistTest[]; statesVersion: number; blank: boolean }>();
+
+function sessionScreenshotBlank(session: SolutionSession): boolean {
+  // entriesForSession returns a cached list until any of its inputs
+  // (playlist, text/result filters, results) changes, so its identity plus
+  // statesVersion covers everything blankness depends on.
+  const entries = entriesForSession(session);
+  const cached = screenshotBlankCache.get(session);
+  if (cached && cached.entries === entries && cached.statesVersion === session.statesVersion) {
+    return cached.blank;
+  }
+  const blank = !entries.some(entry => {
+    const state = session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun';
+    return state === 'passed' || state === 'failed' || state === 'skipped';
+  });
+  screenshotBlankCache.set(session, { entries, statesVersion: session.statesVersion, blank });
+  return blank;
+}
+
 function screenshotWouldBeBlank(): boolean {
   for (const session of sessions.values()) {
     if (session.knownTests === undefined || session.discoveryCts !== undefined) {
       continue;
     }
-    for (const entry of entriesForSession(session)) {
-      const state = session.testResultStates.get(entry.fullyQualifiedName) ?? 'notRun';
-      if (state === 'passed' || state === 'failed' || state === 'skipped') {
-        return false;
-      }
+    if (!sessionScreenshotBlank(session)) {
+      return false;
     }
   }
   return true;
@@ -1524,7 +1795,12 @@ async function selectRunsettings(context: vscode.ExtensionContext, session = act
   if (!uris?.length) {
     return;
   }
-  session.runsettingsPath = uris[0].fsPath;
+  await applyRunsettingsPath(context, session, uris[0].fsPath);
+}
+
+/** Point a solution at a runsettings file (or back to the default when undefined). */
+async function applyRunsettingsPath(context: vscode.ExtensionContext, session: SolutionSession, filePath: string | undefined): Promise<void> {
+  session.runsettingsPath = filePath;
   clearTemporaryOverrides(session);
   watchRunsettingsFile(session);
   await saveSessions(context);
@@ -1563,15 +1839,35 @@ async function openActiveRunsettings(): Promise<void> {
   }
 }
 
+// findDefaultRunsettings readdirs the solution directory; during runs
+// updateViewState fires every ~200 ms and would repeat that readdir on every
+// tick. Cache per solution keyed on the directory's mtime (the same pattern
+// inspectRunsettingsCached uses for the XML inspection): a directory mtime
+// change covers everything that can alter which file is picked.
+const defaultRunsettingsCache = new Map<string, { dirMtimeMs: number; found?: string }>();
+
+function findDefaultRunsettingsCached(solutionPath: string): string | undefined {
+  const dir = path.dirname(solutionPath);
+  let dirMtimeMs: number;
+  try {
+    dirMtimeMs = fs.statSync(dir).mtimeMs;
+  } catch {
+    return findDefaultRunsettings(solutionPath);
+  }
+  const cached = defaultRunsettingsCache.get(solutionPath);
+  if (cached && cached.dirMtimeMs === dirMtimeMs) {
+    return cached.found;
+  }
+  const found = findDefaultRunsettings(solutionPath);
+  defaultRunsettingsCache.set(solutionPath, { dirMtimeMs, found });
+  return found;
+}
+
 function getActiveRunsettings(session: SolutionSession): string | undefined {
   if (session.runsettingsPath && fs.existsSync(session.runsettingsPath)) {
     return session.runsettingsPath;
   }
-  return findDefaultRunsettings(session.solutionPath);
-}
-
-function getOverrideBaseRunsettings(session: SolutionSession): string | undefined {
-  return getActiveRunsettings(session);
+  return findDefaultRunsettingsCached(session.solutionPath);
 }
 
 function getCustomRunsettingsStorageDirectory(): string {
@@ -1579,8 +1875,7 @@ function getCustomRunsettingsStorageDirectory(): string {
   return storageUri?.fsPath ?? path.join(extensionPath ?? path.dirname(__filename), '.storage');
 }
 
-async function setCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, value: string): Promise<void> {
-  const session = activeSession();
+async function setCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, value: string, session = activeSession()): Promise<void> {
   const base = session && getActiveRunsettings(session);
   if (!session || !base) {
     return;
@@ -1597,8 +1892,7 @@ async function setCustomRunsettingsValue(context: vscode.ExtensionContext, key: 
   await updateContexts();
 }
 
-async function resetCustomRunsettingsValue(context: vscode.ExtensionContext, key: string): Promise<void> {
-  const session = activeSession();
+async function resetCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -1619,8 +1913,7 @@ async function resetCustomRunsettingsValue(context: vscode.ExtensionContext, key
   }
 }
 
-async function toggleLockCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, isPermanent: boolean): Promise<void> {
-  const session = activeSession();
+async function toggleLockCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, isPermanent: boolean, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -1648,8 +1941,7 @@ async function toggleLockCustomRunsettingsValue(context: vscode.ExtensionContext
   await updateContexts();
 }
 
-async function toggleLockCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, isPermanent: boolean): Promise<void> {
-  const session = activeSession();
+async function toggleLockCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, isPermanent: boolean, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -1679,9 +1971,8 @@ async function toggleLockCustomRunsettingsParameter(context: vscode.ExtensionCon
   await updateContexts();
 }
 
-async function addCustomRunsettingsParameter(context: vscode.ExtensionContext): Promise<void> {
-  const session = activeSession();
-  const base = session && getOverrideBaseRunsettings(session);
+async function addCustomRunsettingsParameter(context: vscode.ExtensionContext, session = activeSession()): Promise<void> {
+  const base = session && getActiveRunsettings(session);
   if (!session || !base) {
     return;
   }
@@ -1698,28 +1989,31 @@ async function addCustomRunsettingsParameter(context: vscode.ExtensionContext): 
   await updateContexts();
 }
 
-async function updateCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, field: 'name' | 'value', value: string): Promise<void> {
-  const session = activeSession();
+async function updateCustomRunsettingsParameter(
+  context: vscode.ExtensionContext,
+  id: string,
+  field: 'name' | 'value',
+  value: string,
+  session = activeSession()
+): Promise<string | undefined> {
   const base = session && getActiveRunsettings(session);
   const permanent = getPermanentOverrides(session);
   const permParam = permanent.parameters?.find(item => item.id === id);
   const tempParam = session?.customRunsettings.parameters.find(item => item.id === id);
   const parameter = permParam ?? tempParam;
   if (!session || !base || !parameter) {
-    return;
+    return undefined;
   }
   if (field === 'name') {
+    let inspected;
     try {
-      const inspected = await inspectRunsettings(base, session.customRunsettings, permanent);
-      const allCustom = inspected.customParameters;
-      const error = validateCustomParameterName(value, inspected.parameters, allCustom, id);
-      if (error) {
-        vscode.window.showWarningMessage(error);
-        return;
-      }
+      inspected = await inspectRunsettings(base, session.customRunsettings, permanent);
     } catch (err) {
-      vscode.window.showErrorMessage(`Could not read the base runsettings file: ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      return `Could not read the base runsettings file: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    const error = validateCustomParameterName(value, inspected.parameters, inspected.customParameters, id);
+    if (error) {
+      return error;
     }
     parameter.name = value.trim();
   } else {
@@ -1731,10 +2025,10 @@ async function updateCustomRunsettingsParameter(context: vscode.ExtensionContext
     await saveSessions(context);
   }
   await updateContexts();
+  return undefined;
 }
 
-async function removeCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string): Promise<void> {
-  const session = activeSession();
+async function removeCustomRunsettingsParameter(context: vscode.ExtensionContext, id: string, session = activeSession()): Promise<void> {
   if (!session) {
     return;
   }
@@ -1776,12 +2070,16 @@ function watchRunsettingsFile(session: SolutionSession): void {
       }
     }
   );
-  if (!session.runsettingsWatcher) {
+  if (session.runsettingsWatcher) {
+    session.runsettingsWatchRetryMs = undefined;
+  } else {
+    const retryMs = session.runsettingsWatchRetryMs ?? WATCH_RETRY_BASE_MS;
+    session.runsettingsWatchRetryMs = Math.min(retryMs * 2, WATCH_RETRY_MAX_MS);
     setTimeout(() => {
       if (sessions.get(session.key) === session && getActiveRunsettings(session) === file && !session.runsettingsWatcher) {
         watchRunsettingsFile(session);
       }
-    }, 500);
+    }, retryMs);
   }
 }
 
@@ -1820,6 +2118,104 @@ async function inspectRunsettingsCached(
   return view;
 }
 
+interface ApiRunsettingsPayload {
+  base: { available: boolean; path?: string; defaultPath?: string; isDefault: boolean; hasExplicit: boolean; defaultAvailable: boolean };
+  view: CustomRunsettingsViewState;
+  candidates: string[];
+}
+
+/** Runsettings state for one solution, shaped for the web dashboard's modal. */
+async function apiRunsettings(session: SolutionSession): Promise<ApiRunsettingsPayload> {
+  const base = getActiveRunsettings(session);
+  const permanent = getPermanentOverrides(session);
+  const defaultPath = findDefaultRunsettingsCached(session.solutionPath);
+  let view: CustomRunsettingsViewState;
+  if (base && fs.existsSync(base)) {
+    try {
+      view = await inspectRunsettingsCached(session, base, permanent);
+    } catch (err) {
+      view = unavailableRunsettingsView(session, permanent, err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    view = unavailableRunsettingsView(session, permanent, 'No runsettings file found next to the solution.');
+  }
+  return {
+    base: {
+      available: base !== undefined,
+      path: base,
+      defaultPath,
+      isDefault: session.runsettingsPath === undefined && base !== undefined,
+      hasExplicit: session.runsettingsPath !== undefined,
+      defaultAvailable: defaultPath !== undefined
+    },
+    view,
+    candidates: listRunsettingsCandidates(session)
+  };
+}
+
+function unavailableRunsettingsView(session: SolutionSession, permanent: PermanentRunsettingsConfig, message: string): CustomRunsettingsViewState {
+  return {
+    available: false,
+    values: [],
+    parameters: [],
+    customParameters: session.customRunsettings.parameters,
+    permanentValues: [],
+    permanentParameters: [],
+    unresolved: [message],
+    hasCustomizations: hasCustomRunsettings(session.customRunsettings) || hasPermanentRunsettings(permanent)
+  };
+}
+
+function listRunsettingsCandidates(session: SolutionSession): string[] {
+  const dir = path.dirname(session.solutionPath);
+  try {
+    return fs.readdirSync(dir)
+      .filter(name => name.toLowerCase().endsWith('.runsettings'))
+      .sort()
+      .map(name => path.join(dir, name));
+  } catch {
+    return [];
+  }
+}
+
+async function apiApplyRunsettings(
+  context: vscode.ExtensionContext,
+  session: SolutionSession,
+  action: ControlApiRunsettingsAction
+): Promise<ApiRunsettingsPayload> {
+  switch (action.action) {
+    case 'selectFile':
+      await applyRunsettingsPath(context, session, action.path);
+      break;
+    case 'setValue':
+      await setCustomRunsettingsValue(context, action.key, action.value, session);
+      break;
+    case 'resetValue':
+      await resetCustomRunsettingsValue(context, action.key, session);
+      break;
+    case 'lockValue':
+      await toggleLockCustomRunsettingsValue(context, action.key, action.isPermanent, session);
+      break;
+    case 'addParameter':
+      await addCustomRunsettingsParameter(context, session);
+      break;
+    case 'updateParameter': {
+      const error = await updateCustomRunsettingsParameter(context, action.id, action.field, action.value, session);
+      if (error) {
+        throw new ControlApiError(400, error);
+      }
+      break;
+    }
+    case 'removeParameter':
+      await removeCustomRunsettingsParameter(context, action.id, session);
+      break;
+    case 'lockParameter':
+      await toggleLockCustomRunsettingsParameter(context, action.id, action.isPermanent, session);
+      break;
+  }
+  return apiRunsettings(session);
+}
+
 async function updateViewState(): Promise<void> {
   const sequence = ++viewStateSequence;
   const session = activeSession();
@@ -1854,9 +2250,9 @@ async function updateViewState(): Promise<void> {
     activeSessionKey,
     solutionReady: session?.knownTests !== undefined && session.discoveryCts === undefined,
     playlistPath: session?.playlistPath,
-    runsettingsPath: session ? getActiveRunsettings(session) : undefined,
-    runsettingsIsDefault: session ? session.runsettingsPath === undefined && getActiveRunsettings(session) !== undefined : false,
-    defaultRunsettingsAvailable: session ? findDefaultRunsettings(session.solutionPath) !== undefined : false,
+    runsettingsPath: base,
+    runsettingsIsDefault: !!session && session.runsettingsPath === undefined && base !== undefined,
+    defaultRunsettingsAvailable: !!session && findDefaultRunsettingsCached(session.solutionPath) !== undefined,
     hasExplicitRunsettings: session?.runsettingsPath !== undefined,
     filter: session?.activeFilter?.raw ?? '',
     visibleTestCount: session ? entriesForSession(session).length : undefined,
@@ -1865,10 +2261,31 @@ async function updateViewState(): Promise<void> {
     notFoundTests: session?.notFoundTests ?? [],
     customRunsettings: customView,
     skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
-    controlApiEnabled: controlApiSessionEnabled,
-    controlApiRunningPort,
+    controlApiEnabled: controlApiSessionEnabled || vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('controlApiEnabled', false),
+    controlApi: apiCoordinator?.state,
+    controlApiUrl: apiCoordinator?.state.port !== undefined && apiCoordinator.state.sessionId
+      ? `http://localhost:${apiCoordinator.state.port}/${encodeURIComponent(apiCoordinator.state.sessionId)}/`
+      : undefined,
     screenshotEmpty: screenshotWouldBeBlank()
   });
+  // Same dedupe as mainView.postState: refreshes fire several times a second
+  // during a run but rarely change the state. New /events clients receive the
+  // current state on connect, so skipping an identical push loses nothing.
+  if (apiCoordinator) {
+    const state = controlApiState();
+    const serialized = JSON.stringify(state);
+    if (serialized !== lastBroadcastState) {
+      lastBroadcastState = serialized;
+      apiCoordinator.broadcast(ControlApiSseEvent.State, state);
+    }
+    // Registration is comparatively chatty, so only re-push when the solution
+    // inventory (what other windows can see) actually changes.
+    const signature = state.solutions.map(s => `${s.id}:${s.testCount ?? -1}:${s.loading ? 1 : 0}`).join('|');
+    if (signature !== lastSolutionsSignature) {
+      lastSolutionsSignature = signature;
+      apiCoordinator.refreshSolutions();
+    }
+  }
 }
 
 async function navigateToFailureLocation(item: vscode.TestItem | undefined, target: 'callSite' | 'innermostError'): Promise<void> {

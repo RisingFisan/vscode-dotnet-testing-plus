@@ -1,10 +1,9 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { CustomRunsettingsViewState } from './runsettingsManager';
+import { ApiRuntimeState } from './apiCoordinator';
 import { TestResultFilter, TestResultFilterKey, createDefaultTestResultFilter } from './testResultFilter';
 import { ScreenshotOptions, ScreenshotSnapshot } from './screenshot';
-
-export type RunsettingsMode = 'default' | 'override' | 'custom';
 
 export interface SolutionTabState {
   key: string;
@@ -34,7 +33,8 @@ export interface MainViewState {
   notFoundTests: string[];
   customRunsettings?: CustomRunsettingsViewState;
   controlApiEnabled: boolean;
-  controlApiRunningPort?: number;
+  controlApi?: ApiRuntimeState;
+  controlApiUrl?: string;
 }
 
 export interface ScreenshotExportSettings extends ScreenshotOptions {
@@ -62,6 +62,30 @@ export type MainViewAction =
   | { type: 'requestScreenshotPreview'; settings: ScreenshotExportSettings }
   | { type: 'saveScreenshot'; data: string; savePath?: string };
 
+/** The {@link MainViewAction} members whose webview messages carry no fields beyond `type`. */
+type PayloadFreeActionType =
+  | 'addSolution'
+  | 'selectPlaylist'
+  | 'clearPlaylist'
+  | 'selectRunsettings'
+  | 'useDefaultRunsettings'
+  | 'clearRunsettings'
+  | 'openRunsettings'
+  | 'saveAsPlaylist'
+  | 'openScreenshot'
+  | 'closeScreenshot'
+  | 'selectScreenshotSavePath';
+
+const PAYLOAD_FREE_ACTION_TYPES: ReadonlyArray<PayloadFreeActionType> = [
+  'addSolution', 'selectPlaylist', 'clearPlaylist', 'selectRunsettings', 'useDefaultRunsettings',
+  'clearRunsettings', 'openRunsettings', 'saveAsPlaylist', 'openScreenshot', 'closeScreenshot',
+  'selectScreenshotSavePath'
+];
+
+function isPayloadFreeActionType(type: string): type is PayloadFreeActionType {
+  return PAYLOAD_FREE_ACTION_TYPES.some(action => action === type);
+}
+
 interface WebviewMessage {
   type: string;
   text?: string;
@@ -71,7 +95,6 @@ interface WebviewMessage {
   id?: string;
   isPermanent?: boolean;
   field?: 'name' | 'value';
-  mode?: RunsettingsMode;
   resultFilterKey?: TestResultFilterKey;
   settings?: ScreenshotExportSettings;
   data?: string;
@@ -95,7 +118,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     notFoundTests: [],
     customRunsettings: undefined,
     controlApiEnabled: false,
-    controlApiRunningPort: undefined
+    controlApi: undefined,
+    controlApiUrl: undefined
   };
 
   constructor(private readonly onAction: (action: MainViewAction) => void) {}
@@ -164,6 +188,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.onAction({ type: 'removeSolution', key: msg.key });
     } else if (msg.type === 'filter') {
       this.onAction({ type: 'filter', text: msg.text ?? '' });
+    } else if (msg.type === 'clearFilter') {
+      this.onAction({ type: 'clearFilter' });
     } else if (msg.type === 'setResultFilter' && msg.resultFilterKey !== undefined) {
       this.onAction({ type: 'setResultFilter', key: msg.resultFilterKey, checked: msg.checked ?? true });
     } else if (msg.type === 'toggleSkipPreBreakpoint') {
@@ -190,8 +216,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.onAction({ type: 'requestScreenshotPreview', settings: msg.settings });
     } else if (msg.type === 'saveScreenshot' && msg.data !== undefined) {
       this.onAction({ type: 'saveScreenshot', data: msg.data, savePath: msg.savePath });
-    } else {
-      this.onAction({ type: msg.type } as MainViewAction);
+    } else if (isPayloadFreeActionType(msg.type)) {
+      this.onAction({ type: msg.type });
     }
   }
 
@@ -220,7 +246,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       resultFilter: s.resultFilter,
       skipPreBreakpoint: s.skipPreBreakpoint,
       controlApiEnabled: s.controlApiEnabled,
-      controlApiRunningPort: s.controlApiRunningPort,
+      controlApi: s.controlApi,
+      controlApiUrl: s.controlApiUrl,
       notFoundTests: s.notFoundTests,
       customRunsettings: s.customRunsettings
     };
@@ -477,7 +504,8 @@ function renderHtml(screenshotOnly = false): string {
       <div class="help-popup-title">Modifiers:</div>
       <ul class="help-popup-list">
         <li><strong>:</strong> — searches within the full name;</li>
-        <li><strong>=</strong> — does an exact search.</li>
+        <li><strong>=</strong> — does an exact search;</li>
+        <li><strong>!</strong> — negates a search (e.g. <code>!testName</code>, <code>class:!className</code>, <code>project=!fullProjectName</code>).</li>
       </ul>
       <div class="help-popup-title">Connectors:</div>
       <ul class="help-popup-list">
@@ -571,15 +599,15 @@ function renderHtml(screenshotOnly = false): string {
     <div class="divider" style="border-top: 1px solid var(--vscode-surface-border);"></div>
     <div class="section control-api-section">
       <div class="row">
-        <label class="switch-toggle" title="Exposes an internal API that allows LLMs to interact with the extension. Install the corresponding skill though the &apos;Install Agent Skill&apos; option in the dropdown.">
+        <label class="switch-toggle" title="Exposes an internal API that allows LLMs and browsers to interact with the extension. Every VS Code window shares one API. Install the matching skill through the &apos;Install Agent Skill&apos; option in the dropdown.">
           <input type="checkbox" id="controlApiEnabled"/>
           <span class="switch-track"><span class="switch-thumb"></span></span>
-          <span class="label">Expose to Agents (Experimental)</span>
+          <span class="label">Enable API</span>
         </label>
       </div>
-      <div class="row control-api-port-row" id="controlApiPortRow" hidden>
-        <span class="label">Port:</span>
-        <span class="name" id="controlApiPortDisplay"></span>
+      <div class="row control-api-status-row" id="controlApiStatusRow" hidden>
+        <span class="name" id="controlApiStatus"></span>
+        <a id="controlApiWebLink" target="_blank" style="margin-left: auto; text-decoration: none; color: var(--vscode-textLink-foreground);" href="#">Open Dashboard ↗</a>
       </div>
     </div>
   </div>
@@ -1380,13 +1408,6 @@ function renderHtml(screenshotOnly = false): string {
     const warnings = $('customRunsettingsWarnings');
     const add = $('addCustomParameter');
     groups.replaceChildren();
-    if (!custom || !custom.available) {
-      section.open = false;
-      hint.textContent = custom?.unresolved?.[0] || 'Select a runsettings file to customize its values.';
-      add.disabled = true;
-      warnings.hidden = true;
-      return;
-    }
     hint.textContent = custom.hasCustomizations
       ? 'Changed values are stored in workspace storage; the original file is never edited.'
       : 'Values are inherited from the selected runsettings file until changed.';
@@ -1441,7 +1462,9 @@ function renderHtml(screenshotOnly = false): string {
     // the source of truth.
     if (document.activeElement !== input && !debounce && !userEditedFilter && input.value !== (s.filter ?? '')) {
       input.value = s.filter ?? '';
-    } else if (!userEditedFilter && (s.filter ?? '') === input.value) {
+    } else if (userEditedFilter && (s.filter ?? '') === input.value) {
+      // The state echo caught up with what the user typed; later state
+      // changes may stomp the input again.
       userEditedFilter = false;
     }
     ['passing', 'failing', 'notRun', 'skipped'].forEach(key => {
@@ -1463,11 +1486,22 @@ function renderHtml(screenshotOnly = false): string {
     $('useDefaultRunsettings').disabled = !s.solutionReady || !s.defaultRunsettingsAvailable || !!s.runsettingsIsDefault;
     $('skipPreBreakpoint').checked = !!s.skipPreBreakpoint;
     $('controlApiEnabled').checked = !!s.controlApiEnabled;
-    if (s.controlApiEnabled && s.controlApiRunningPort) {
-      $('controlApiPortRow').hidden = false;
-      $('controlApiPortDisplay').textContent = String(s.controlApiRunningPort);
+    const api = s.controlApi;
+    if (api && (api.role === 'host' || api.role === 'peer')) {
+      $('controlApiStatusRow').hidden = false;
+      $('controlApiStatus').textContent = api.role === 'host' ? 'Hosting shared API' : 'Connected to shared API';
+      if (s.controlApiUrl) {
+        $('controlApiWebLink').href = s.controlApiUrl;
+        $('controlApiWebLink').style.display = '';
+      } else {
+        $('controlApiWebLink').style.display = 'none';
+      }
+    } else if (api && api.role === 'error') {
+      $('controlApiStatusRow').hidden = false;
+      $('controlApiStatus').textContent = api.message || 'Could not start the API';
+      $('controlApiWebLink').style.display = 'none';
     } else {
-      $('controlApiPortRow').hidden = true;
+      $('controlApiStatusRow').hidden = true;
     }
     const multiSolutions = (s.sessions || []).length > 1;
     $('searchAllSolutionsRow').hidden = !multiSolutions;
