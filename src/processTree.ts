@@ -133,7 +133,7 @@ export function killAllTrackedChildren(): void {
 }
 
 /** Parse `ps -A -o pid=,ppid=` output into a parent -> children map. */
-export function parseProcessTable(stdout: string): Map<number, number[]> {
+function parseProcessTable(stdout: string): Map<number, number[]> {
   const parentToChildren = new Map<number, number[]>();
   for (const line of stdout.split(/\r?\n/)) {
     const parts = line.trim().split(/\s+/);
@@ -156,7 +156,7 @@ export function parseProcessTable(stdout: string): Map<number, number[]> {
 }
 
 /** Breadth-first descendants of `rootPid` (excluding it) from a process table. */
-export function descendantsOf(rootPid: number, table: ReadonlyMap<number, number[]>): number[] {
+function descendantsOf(rootPid: number, table: ReadonlyMap<number, number[]>): number[] {
   const descendants: number[] = [];
   const seen = new Set<number>([rootPid]);
   const queue = [rootPid];

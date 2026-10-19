@@ -11,6 +11,7 @@ import { killProcessTree, spawnTracked } from './processTree';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 import { collectProjectCoverage, CoverageState, newCoverageState } from './coverage';
+import { asArray } from './util';
 
 /**
  * Upper bound for a single `--filter` argument. Windows caps a whole command
@@ -62,13 +63,6 @@ interface RunOptions {
   skipPreBreakpoint?: boolean;
   onTestStateChange?: (test: vscode.TestItem, state: TestResultState, durationMs?: number) => void;
   onTestFailureLocations?: (test: vscode.TestItem, locations: TestFailureLocations) => void;
-}
-
-function asArray<T>(value: T | T[] | undefined): T[] {
-  if (value === undefined) {
-    return [];
-  }
-  return Array.isArray(value) ? value : [value];
 }
 
 function appendOutput(run: vscode.TestRun, text: string): void {
@@ -203,31 +197,41 @@ function filterEntryFor(test: vscode.TestItem, options?: RunOptions): string {
   return `FullyQualifiedName=${descriptorFor(test, options)?.fullyQualifiedName ?? test.id}`;
 }
 
+/** A batch of tests plus the prepared `--filter` expression for its invocation. */
+interface TestBatch {
+  tests: vscode.TestItem[];
+  filter: string;
+}
+
 /**
  * Batch tests so that no `dotnet test` invocation's `--filter` argument
  * approaches the OS argument-length limit. Typical projects fit in one batch
  * (one process, live results, no per-invocation startup overhead); only very
- * large selections split across invocations.
+ * large selections split across invocations. The filter is built here so the
+ * invocation does not recompute the same strings.
  */
 function batchByFilterLength(
   tests: readonly vscode.TestItem[],
   options?: RunOptions
-): vscode.TestItem[][] {
-  const batches: vscode.TestItem[][] = [];
+): TestBatch[] {
+  const batches: TestBatch[] = [];
   let current: vscode.TestItem[] = [];
+  let entries: string[] = [];
   let length = 0;
   for (const test of tests) {
     const entry = filterEntryFor(test, options);
     if (current.length > 0 && length + entry.length + 1 > FILTER_ARG_LIMIT) {
-      batches.push(current);
+      batches.push({ tests: current, filter: entries.join('|') });
       current = [];
+      entries = [];
       length = 0;
     }
     current.push(test);
+    entries.push(entry);
     length += entry.length + 1;
   }
   if (current.length > 0) {
-    batches.push(current);
+    batches.push({ tests: current, filter: entries.join('|') });
   }
   return batches;
 }
@@ -289,10 +293,10 @@ async function runSolutionTests(
     }
     for (const batch of batchByFilterLength(projectTests, solutionOptions)) {
       if (token.isCancellationRequested) {
-        batch.forEach(test => skipTest(run, test, solutionOptions));
+        batch.tests.forEach(test => skipTest(run, test, solutionOptions));
         continue;
       }
-      await runChunk(csproj, batch, run, token, debug, solutionOptions, true);
+      await runChunk(csproj, batch.tests, run, token, debug, solutionOptions, true, batch.filter);
     }
     if (solutionOptions.coverageState) {
       solutionOptions.coverageState.files.push(
@@ -310,9 +314,7 @@ interface LiveContext {
   run: vscode.TestRun;
   options?: RunOptions;
   tests: vscode.TestItem[];
-  /** Test ids that have received a result (any outcome). */
-  reported: Set<string>;
-  /** Aggregated outcome per test id; see {@link outcomeRank}. */
+  /** Aggregated outcome per test id (having an entry means it was reported); see {@link outcomeRank}. */
   outcomes: Map<string, string>;
   /** Lazily built FQN -> test items index. */
   index?: Map<string, vscode.TestItem[]>;
@@ -320,6 +322,8 @@ interface LiveContext {
   trxFiles: string[];
   /** TRX paths already parsed successfully (never parsed twice). */
   parsedTrx: Set<string>;
+  /** Sequential chain of pending TRX parses; outcomes apply in TRX arrival order. */
+  trxQueue: Promise<void>;
   /** Flush the stream-logger tail; set while a tailer is active. */
   drainStream?: () => void;
 }
@@ -329,10 +333,10 @@ function createLiveContext(run: vscode.TestRun, options: RunOptions | undefined,
     run,
     options,
     tests,
-    reported: new Set<string>(),
     outcomes: new Map<string, string>(),
     trxFiles: [],
-    parsedTrx: new Set<string>()
+    parsedTrx: new Set<string>(),
+    trxQueue: Promise.resolve()
   };
 }
 
@@ -428,7 +432,6 @@ function reportOutcome(
     return;
   }
   ctx.outcomes.set(test.id, outcome);
-  ctx.reported.add(test.id);
   switch (outcome) {
     case 'Passed':
       setTestState(ctx.options, test, 'passed', durationMs);
@@ -441,8 +444,9 @@ function reportOutcome(
       if (frames.length > 0) {
         message.stackTrace = frames;
       }
-      const testDeclLoc = descriptorFor(test, ctx.options)?.location ?? ctx.options?.locations?.get(test.id);
-      const testFqn = descriptorFor(test, ctx.options)?.fullyQualifiedName ?? test.id;
+      const descriptor = descriptorFor(test, ctx.options);
+      const testDeclLoc = descriptor?.location ?? ctx.options?.locations?.get(test.id);
+      const testFqn = descriptor?.fullyQualifiedName ?? test.id;
       const topFrame = frames.find(f => f.uri !== undefined && f.position !== undefined);
       const callSiteFrame = findCallSiteFrame(frames, testDeclLoc, testFqn);
 
@@ -644,17 +648,21 @@ function processLine(ctx: LiveContext, rawLine: string, resultFiles: string[]): 
   // The stream logger writes every result before the TRX exists, so flush it
   // first; when it already covered every test the TRX needs no parsing.
   ctx.drainStream?.();
-  if (ctx.reported.size >= ctx.tests.length) {
+  if (ctx.outcomes.size >= ctx.tests.length) {
     return;
   }
   // The TRX is fully written by the time this line is printed; parse it
-  // immediately so results show up as each test project finishes.
-  try {
-    reportMatchedResults(ctx, readTrxResults(trxPath));
-    ctx.parsedTrx.add(trxPath);
-  } catch {
-    // The file may still be locked; the end-of-run sweep retries it.
-  }
+  // immediately so results show up as each test project finishes. The parse
+  // is async (multi-MB read) and chained onto the queue so outcomes apply in
+  // TRX arrival order without blocking the stdout handler.
+  ctx.trxQueue = ctx.trxQueue
+    .then(async () => {
+      reportMatchedResults(ctx, await readTrxResults(trxPath));
+      ctx.parsedTrx.add(trxPath);
+    })
+    .catch(() => {
+      // The file may still be locked; the end-of-run sweep retries it.
+    });
 }
 
 interface LineFeeder {
@@ -686,12 +694,21 @@ function createLineFeeder(ctx: LiveContext, resultFiles: string[]): LineFeeder {
   };
 }
 
+// Both build and test pass the configuration explicitly: a solution build
+// gets `Configuration=Debug` from the generated solution metaproj, but a
+// standalone `dotnet test <csproj>` never does — and MES-style
+// Directory.Build.props consume `$(Configuration)` during the props phase
+// (before the common targets default it to Debug), so without an explicit
+// value the output path bakes to a flat `bin/` the build never populated
+// ("The argument <dll> is invalid"). Build and test must always agree.
+const BUILD_CONFIGURATION = 'Debug';
+
 function buildSolutionOnce(
   solutionPath: string,
   run: vscode.TestRun,
   token: vscode.CancellationToken
 ): Promise<void> {
-  const args = ['build', solutionPath, '--nologo', '--tl:off'];
+  const args = ['build', solutionPath, '-c', BUILD_CONFIGURATION, '--nologo', '--tl:off'];
   logCommand('dotnet', args);
   appendOutput(run, `Building solution: ${solutionPath}\n`);
   return new Promise((resolve, reject) => {
@@ -719,6 +736,7 @@ function buildSolutionOnce(
       }
     });
     if (token.isCancellationRequested) {
+      cancelSub.dispose();
       killProcessTree(child);
       reject(new Error('Build cancelled'));
     }
@@ -732,15 +750,16 @@ async function runChunk(
   token: vscode.CancellationToken,
   debug: boolean,
   options?: RunOptions,
-  noBuild = false
+  noBuild = false,
+  preparedFilter?: string
 ): Promise<void> {
   tests.forEach(t => {
     setTestState(options, t, 'queued');
     run.enqueued(t);
   });
 
-  const filter = fqnFilter(tests, options);
-  const args = ['test', target, '--filter', filter, '--nologo', '--logger', 'trx', '-c', 'Debug', '--tl:off'];
+  const filter = preparedFilter ?? fqnFilter(tests, options);
+  const args = ['test', target, '--filter', filter, '--nologo', '--logger', 'trx', '-c', BUILD_CONFIGURATION, '--tl:off'];
   if (noBuild) {
     args.push('--no-build');
   }
@@ -775,6 +794,9 @@ async function runChunk(
       ? await debugDotnetTest(args, run, token, ctx, streamLogPath)
       : await runDotnetTest(args, run, token, ctx, streamLogPath);
     stopTailer?.();
+    // Pending TRX parses scheduled while streaming must settle before the
+    // sweep decides what is left.
+    await ctx.trxQueue;
 
     if (resultFiles.length === 0) {
       throw new Error('No test results were produced. Check the test output for build errors.');
@@ -785,13 +807,13 @@ async function runChunk(
     // (e.g. still locked). It is skipped entirely when every test already has
     // a result (the stream logger normally delivers them all), and a TRX that
     // was already read successfully is never parsed a second time.
-    if (ctx.reported.size < ctx.tests.length) {
+    if (ctx.outcomes.size < ctx.tests.length) {
       for (const trxPath of resultFiles) {
         if (ctx.parsedTrx.has(trxPath)) {
           continue;
         }
         try {
-          reportMatchedResults(ctx, readTrxResults(trxPath));
+          reportMatchedResults(ctx, await readTrxResults(trxPath));
           ctx.parsedTrx.add(trxPath);
         } catch {
           // ignore unreadable TRX; unmatched tests are marked skipped below
@@ -799,14 +821,17 @@ async function runChunk(
       }
     }
     for (const test of ctx.tests) {
-      if (!ctx.reported.has(test.id)) {
+      if (!ctx.outcomes.has(test.id)) {
         skipTest(run, test, options);
       }
     }
   } catch (err) {
+    // Let in-flight TRX parses report first; only tests with no outcome at
+    // all are marked below.
+    await ctx.trxQueue;
     const message = err instanceof Error ? err.message : String(err);
     for (const test of ctx.tests) {
-      if (ctx.reported.has(test.id)) {
+      if (ctx.outcomes.has(test.id)) {
         continue;
       }
       if (token.isCancellationRequested) {
@@ -830,6 +855,10 @@ async function runChunk(
     for (const f of new Set([...resultFiles, ...ctx.trxFiles])) {
       try {
         fs.rmSync(f, { force: true });
+        // dotnet writes one GUID directory per run under TestResults; drop it
+        // once empty so the directory does not accumulate (rmdir refuses when
+        // anything else is still inside).
+        fs.rmdirSync(path.dirname(f));
       } catch {
         // best-effort cleanup
       }
@@ -1147,8 +1176,12 @@ function parseDuration(duration?: string): number | undefined {
 
 const TRX_PARSER = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
-function readTrxResults(trxPath: string): TrxResult[] {
-  const xml = fs.readFileSync(trxPath, 'utf8');
+async function readTrxResults(trxPath: string): Promise<TrxResult[]> {
+  // TRX files can be several MB: read asynchronously and let the event loop
+  // breathe before the synchronous parse so the extension host stays
+  // responsive (same reason as the Cobertura parse).
+  const xml = await fs.promises.readFile(trxPath, 'utf8');
+  await new Promise<void>(resolve => setImmediate(resolve));
   const testRun = TRX_PARSER.parse(xml).TestRun;
 
   const fqnByTestId = new Map<string, string>();
