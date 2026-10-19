@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { findAllSolutionFiles, findRootSolutionFiles } from './solutionParser';
 import { log } from './logger';
+import { compareTextNumeric } from './collation';
 
 /**
  * If exactly one .sln exists at a workspace folder root, use it.
@@ -53,7 +54,7 @@ export async function pickSolutionInteractively(): Promise<string | undefined> {
         fsPath: u.fsPath
       };
     })
-    .sort((a, b) => a.detail.localeCompare(b.detail, undefined, { sensitivity: 'base', numeric: true }));
+    .sort((a, b) => compareTextNumeric(a.detail, b.detail));
 
   const picked = await vscode.window.showQuickPick(
     items,
