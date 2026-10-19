@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { XMLParser } from 'fast-xml-parser';
+import { asArray } from './util';
 
 /**
  * Collects Cobertura coverage produced by `dotnet test --collect:"XPlat Code
@@ -109,13 +110,13 @@ async function mergeCobertura(reportPath: string, projectDir: string, merged: Ma
   const doc = COBERTURA_PARSER.parse(xml) as {
     coverage?: {
       packages?: {
-        package?: unknown;
+        package?: Record<string, unknown> | Record<string, unknown>[];
       };
     };
   };
   const packages = asArray<Record<string, unknown>>(doc.coverage?.packages?.package);
   for (const pkg of packages) {
-    const classes = asArray<Record<string, unknown>>((pkg.classes as { class?: unknown } | undefined)?.class);
+    const classes = asArray<Record<string, unknown>>((pkg.classes as { class?: Record<string, unknown> | Record<string, unknown>[] } | undefined)?.class);
     for (const cls of classes) {
       const file = resolveSourceFile(cls.filename, projectDir);
       if (!file) {
@@ -123,7 +124,7 @@ async function mergeCobertura(reportPath: string, projectDir: string, merged: Ma
       }
       const lines = merged.get(file) ?? new Map<number, CoverageLine>();
       merged.set(file, lines);
-      const lineEntries = asArray<Record<string, unknown>>((cls.lines as { line?: unknown } | undefined)?.line);
+      const lineEntries = asArray<Record<string, unknown>>((cls.lines as { line?: Record<string, unknown> | Record<string, unknown>[] } | undefined)?.line);
       for (const line of lineEntries) {
         const number = Number(line['@_number']);
         if (!Number.isInteger(number) || number < 1) {
@@ -144,13 +145,6 @@ async function mergeCobertura(reportPath: string, projectDir: string, merged: Ma
       }
     }
   }
-}
-
-function asArray<T>(value: unknown): T[] {
-  if (Array.isArray(value)) {
-    return value as T[];
-  }
-  return value ? [value as T] : [];
 }
 
 function parseConditionCoverage(value: unknown): { covered: number; total: number }[] | undefined {

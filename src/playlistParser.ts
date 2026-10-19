@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { XMLParser } from 'fast-xml-parser';
 import { compareText } from './collation';
+import { asArray } from './util';
 
 export interface PlaylistTest {
   project?: string;
@@ -27,11 +28,13 @@ interface XmlRule {
   Rule?: XmlRule | XmlRule[];
 }
 
-function asArray<T>(value: T | T[] | undefined): T[] {
-  if (value === undefined) {
-    return [];
-  }
-  return Array.isArray(value) ? value : [value];
+interface XmlPlaylist {
+  Add?: XmlAdd | XmlAdd[];
+  Rule?: XmlRule | XmlRule[];
+}
+
+interface XmlAdd {
+  '@_Test'?: string;
 }
 
 function entryFromFqn(fqn: string, project?: string): PlaylistTest {
@@ -44,7 +47,7 @@ function entryFromFqn(fqn: string, project?: string): PlaylistTest {
 
 export function parsePlaylist(xml: string): ParsedPlaylist {
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-  const doc = parser.parse(xml);
+  const doc = parser.parse(xml) as { Playlist?: XmlPlaylist };
   const root = doc.Playlist;
   if (!root) {
     throw new Error('Not a valid .playlist file: missing <Playlist> root element.');
@@ -53,7 +56,7 @@ export function parsePlaylist(xml: string): ParsedPlaylist {
   const includes: PlaylistTest[] = [];
   const excludes: PlaylistTest[] = [];
 
-  for (const add of asArray<any>(root.Add)) {
+  for (const add of asArray(root.Add)) {
     const fqn: string | undefined = add['@_Test'];
     if (fqn) {
       includes.push(entryFromFqn(fqn));
@@ -112,7 +115,7 @@ export function parsePlaylist(xml: string): ParsedPlaylist {
     }
   };
 
-  for (const rule of asArray<XmlRule>(root.Rule)) {
+  for (const rule of asArray(root.Rule)) {
     walk(rule, {}, rule['@_Name']?.toLowerCase() === 'excludes' ? excludes : includes);
   }
 
