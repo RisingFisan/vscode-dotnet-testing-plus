@@ -5,7 +5,7 @@ import { compareText } from './collation';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 
-export const PLACEHOLDER_ID = 'placeholder';
+const PLACEHOLDER_ID = 'placeholder';
 
 function keyPart(value: string): string {
   return encodeURIComponent(value);
@@ -19,7 +19,10 @@ export function testItemId(solutionPath: string, fullyQualifiedName: string): st
   return `test:${keyPart(solutionPath)}:${keyPart(fullyQualifiedName)}`;
 }
 
-function projectLabelOf(entry: PlaylistTest): string {
+// Label helpers are shared with the screenshot snapshot (screenshot.ts) so
+// the tree and its screenshot can never disagree on labels.
+
+function playlistProjectLabel(entry: PlaylistTest): string {
   if (entry.project) {
     return entry.project;
   }
@@ -29,8 +32,31 @@ function projectLabelOf(entry: PlaylistTest): string {
   return 'Playlist';
 }
 
-function solutionLabel(solutionPath: string): string {
+/**
+ * Project label for a playlist entry, preferring the owning .csproj from the
+ * source scan over playlist Project/namespace metadata (playlist Project can
+ * be a common product name rather than the actual test project).
+ */
+export function projectLabel(entry: PlaylistTest, projectPath?: string): string {
+  return projectPath
+    ? path.basename(projectPath, path.extname(projectPath))
+    : playlistProjectLabel(entry);
+}
+
+export function solutionLabel(solutionPath: string): string {
   return path.basename(solutionPath, path.extname(solutionPath));
+}
+
+/** Class portion of a test FQN (everything before the final dot). */
+function classNameOf(fqn: string): string {
+  const lastDot = fqn.lastIndexOf('.');
+  return lastDot === -1 ? fqn : fqn.slice(0, lastDot);
+}
+
+/** Class label: the class name with the project-label prefix stripped when present. */
+export function classLabelOf(fqn: string, project: string): string {
+  const className = classNameOf(fqn);
+  return className.startsWith(`${project}.`) ? className.slice(project.length + 1) : className;
 }
 
 export interface SolutionTreeOptions {
@@ -39,7 +65,7 @@ export interface SolutionTreeOptions {
   testResultStates?: ReadonlyMap<string, TestResultState>;
 }
 
-export function formatGroupLabel(baseLabel: string, passed: number, total: number): string {
+function formatGroupLabel(baseLabel: string, passed: number, total: number): string {
   return `${baseLabel} (${passed}/${total})`;
 }
 
@@ -78,51 +104,6 @@ export function updateGroupLabels(root: vscode.TestItem, testResultStates: Reado
   }
 
   computeGroup(root);
-}
-
-/**
- * Updates group labels from the test item up through all of its ancestors (class, project, solution root).
- * Skips counting tests with 'skipped' state.
- */
-export function updateAncestorGroupLabels(test: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): void {
-  let current = test.parent;
-  while (current) {
-    updateSingleGroupLabel(current, testResultStates);
-    current = current.parent;
-  }
-}
-
-function countGroupTests(group: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): { passed: number; total: number } {
-  let passed = 0;
-  let total = 0;
-
-  function walk(item: vscode.TestItem): void {
-    if (item.children.size === 0) {
-      const fqn = fqnOfItem(item);
-      const state = (fqn ? testResultStates.get(fqn) : undefined) ?? 'notRun';
-      if (state !== 'skipped') {
-        total += 1;
-        if (state === 'passed') {
-          passed += 1;
-        }
-      }
-      return;
-    }
-    item.children.forEach(child => walk(child));
-  }
-
-  walk(group);
-  return { passed, total };
-}
-
-export function updateSingleGroupLabel(group: vscode.TestItem, testResultStates: ReadonlyMap<string, TestResultState>): void {
-  const counts = countGroupTests(group, testResultStates);
-  const base = group.sortText ?? group.label;
-  group.sortText = base;
-  const label = formatGroupLabel(base, counts.passed, counts.total);
-  if (group.label !== label) {
-    group.label = label;
-  }
 }
 
 // Decoding an id (split + decodeURIComponent) per leaf per label pass is the
@@ -170,11 +151,7 @@ export function buildSolutionTree(
       continue;
     }
     const projectPath = options?.projects?.get(entry.fullyQualifiedName);
-    // Playlist Project metadata can be a common product name rather than the
-    // actual test project. The source scan identifies the owning .csproj.
-    const label = projectPath
-      ? path.basename(projectPath, path.extname(projectPath))
-      : projectLabelOf(entry);
+    const label = projectLabel(entry, projectPath);
     const projectId = `${root.id}:project:${keyPart(projectPath ?? label)}`;
     let projectItem = projectItems.get(projectId);
     if (!projectItem) {
@@ -186,7 +163,7 @@ export function buildSolutionTree(
     const fqn = entry.fullyQualifiedName;
     const lastDot = fqn.lastIndexOf('.');
     const className = lastDot === -1 ? fqn : fqn.slice(0, lastDot);
-    const classLabel = className.startsWith(`${label}.`) ? className.slice(label.length + 1) : className;
+    const classLabel = classLabelOf(fqn, label);
     const testName = lastDot === -1 ? fqn : fqn.slice(lastDot + 1);
     const classId = `${projectItem.id}:class:${keyPart(className)}`;
     let classItem = projectItem.children.get(classId);

@@ -1,7 +1,7 @@
-import * as path from 'path';
 import { PlaylistTest } from './playlistParser';
 import { TestResultState } from './testResultFilter';
 import { compareText } from './collation';
+import { classLabelOf, projectLabel, solutionLabel } from './testTree';
 
 export type ScreenshotGroupBy = 'project' | 'class' | 'test';
 export type ScreenshotState = 'passed' | 'failed' | 'skipped' | 'notRun';
@@ -72,26 +72,10 @@ function isShown(state: ScreenshotState, show: ScreenshotShowOptions): boolean {
   }
 }
 
-function solutionLabel(solutionPath: string): string {
-  return path.basename(solutionPath, path.extname(solutionPath));
-}
+// Labels (solution/project/class) come from testTree.ts so the screenshot
+// always matches what the Test Explorer shows.
 
-function projectLabel(entry: PlaylistTest, projects: ReadonlyMap<string, string>): string {
-  const projectPath = projects.get(entry.fullyQualifiedName);
-  return projectPath
-    ? path.basename(projectPath, path.extname(projectPath))
-    : entry.project ?? entry.namespace?.split('.')[0] ?? 'Playlist';
-}
-
-function classLabel(entry: PlaylistTest, project: string): string {
-  const fqn = entry.fullyQualifiedName;
-  const lastDot = fqn.lastIndexOf('.');
-  const className = lastDot === -1 ? fqn : fqn.slice(0, lastDot);
-  return className.startsWith(`${project}.`) ? className.slice(project.length + 1) : className;
-}
-
-function groupState(children: ScreenshotNode[]): ScreenshotState {
-  const tests = collectTests(children);
+function groupState(tests: ScreenshotTest[]): ScreenshotState {
   if (tests.length > 0 && tests.every(test => test.state === 'passed')) {
     return 'passed';
   }
@@ -117,6 +101,7 @@ function collectTests(nodes: ScreenshotNode[]): ScreenshotTest[] {
 }
 
 function makeGroup(kind: ScreenshotGroup['kind'], label: string, children: ScreenshotNode[]): ScreenshotGroup {
+  // Flatten the subtree once; both the state and the counts derive from it.
   const tests = collectTests(children);
   const knownDurations = tests
     .map(test => test.durationMs)
@@ -124,7 +109,7 @@ function makeGroup(kind: ScreenshotGroup['kind'], label: string, children: Scree
   return {
     kind,
     label,
-    state: groupState(children),
+    state: groupState(tests),
     passed: tests.filter(test => test.state === 'passed').length,
     total: tests.length,
     durationMs: knownDurations.length > 0 ? knownDurations.reduce((sum, duration) => sum + duration, 0) : undefined,
@@ -162,7 +147,7 @@ export function buildScreenshotSnapshot(data: ScreenshotSessionData[], options: 
     } else {
       const byProject = new Map<string, Array<{ entry: PlaylistTest; state: ScreenshotState }>>();
       for (const item of tests) {
-        const label = projectLabel(item.entry, session.projects);
+        const label = projectLabel(item.entry, session.projects.get(item.entry.fullyQualifiedName));
         const entries = byProject.get(label) ?? [];
         entries.push(item);
         byProject.set(label, entries);
@@ -175,7 +160,7 @@ export function buildScreenshotSnapshot(data: ScreenshotSessionData[], options: 
         }
         const byClass = new Map<string, Array<{ entry: PlaylistTest; state: ScreenshotState }>>();
         for (const item of projectTests) {
-          const label = classLabel(item.entry, project);
+          const label = classLabelOf(item.entry.fullyQualifiedName, project);
           const entries = byClass.get(label) ?? [];
           entries.push(item);
           byClass.set(label, entries);
