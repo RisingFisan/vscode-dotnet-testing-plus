@@ -17,3 +17,7 @@ node_modules/web-tree-sitter/*.wasm.map
 node_modules/web-tree-sitter/web-tree-sitter.wasm
 
 dummy-mes/**
+
+# Knowledge bundle: documentation for agents/humans, not extension runtime data.
+knowledge/**
+okf-base.yaml
