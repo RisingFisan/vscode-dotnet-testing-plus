@@ -13,7 +13,7 @@ import { TestResultState } from './testResultFilter';
 import { collectProjectCoverage, CoverageState, newCoverageState } from './coverage';
 import { checkBuild, getBuildStamp, markBuildClean, markBuildDirty } from './buildState';
 import { summarizeBuildInputs } from './buildInputs';
-import { CaptureKind, CaptureStatus, RunDiagnosticsStore } from './runDiagnostics';
+import { CaptureKind, CaptureStatus, RunCapture, RunDiagnosticsStore } from './runDiagnostics';
 import { asArray } from './util';
 
 /**
@@ -357,6 +357,8 @@ const RESULTS_FILE_LINE_RE = /Results File:\s*(.+?\.trx)/i;
 interface LiveContext {
   run: vscode.TestRun;
   options?: RunOptions;
+  /** Staged diagnostics for this chunk; also the only sink for its raw output. */
+  capture?: RunCapture;
   tests: vscode.TestItem[];
   /** Aggregated outcome per test id (having an entry means it was reported); see {@link outcomeRank}. */
   outcomes: Map<string, string>;
@@ -372,11 +374,17 @@ interface LiveContext {
   drainStream?: () => void;
 }
 
-function createLiveContext(run: vscode.TestRun, options: RunOptions | undefined, tests: vscode.TestItem[]): LiveContext {
+function createLiveContext(
+  run: vscode.TestRun,
+  options: RunOptions | undefined,
+  tests: vscode.TestItem[],
+  capture?: RunCapture
+): LiveContext {
   return {
     run,
     options,
     tests,
+    capture,
     outcomes: new Map<string, string>(),
     trxFiles: [],
     parsedTrx: new Set<string>(),
@@ -947,9 +955,14 @@ async function buildSolutionOnce(
     if (status === CaptureStatus.Failed) {
       capture?.addFailures(1);
     }
-    const retained = diagnostics?.settle(capture, status, status !== CaptureStatus.Passed);
+    const keep = status !== CaptureStatus.Passed;
+    const retained = diagnostics?.settle(capture, status, keep);
     if (retained) {
       log(`Build diagnostics retained: ${retained}`);
+    } else if (capture && keep) {
+      // Losing the output of a failed build is exactly what retention exists to
+      // prevent, so say when it could not be kept instead of failing silently.
+      log('[error] build diagnostics could not be retained (see the diagnostics output for staging errors)');
     }
   }
   return { fullSolution };
@@ -1002,7 +1015,7 @@ async function runChunk(
   setRunCapture(capture);
   let status = CaptureStatus.Passed;
 
-  const ctx = createLiveContext(run, options, tests);
+  const ctx = createLiveContext(run, options, tests, capture);
   let resultFiles: string[] = [];
   const streamLogPath = useStreamLogger
     ? path.join(os.tmpdir(), `playlist-stream-${process.pid}-${Date.now()}-${crypto.randomUUID()}.jsonl`)
@@ -1092,6 +1105,8 @@ async function runChunk(
     const retained = diagnostics?.settle(capture, status, keep);
     if (retained) {
       log(`Run diagnostics retained: ${retained}`);
+    } else if (capture && keep) {
+      log('[error] run diagnostics could not be retained (see the diagnostics output for staging errors)');
     }
     if (streamLogPath) {
       try {
@@ -1178,12 +1193,12 @@ function runDotnetTest(
 
     child.stdout?.on('data', (text: string) => {
       sawStdout = true;
-      logChunk('stdout', text);
+      logChunk(ctx.capture, 'stdout', text);
       appendOutput(run, text);
       feeder.feed(text);
     });
     child.stderr?.on('data', (text: string) => {
-      logChunk('stderr', text);
+      logChunk(ctx.capture, 'stderr', text);
       appendOutput(run, text);
     });
     child.on('error', err => {
@@ -1264,7 +1279,7 @@ function debugDotnetTest(
     }));
 
     child.stdout?.on('data', (text: string) => {
-      logChunk('stdout', text);
+      logChunk(ctx.capture, 'stdout', text);
       appendOutput(run, text);
       feeder.feed(text);
       if (!attached) {
@@ -1297,7 +1312,7 @@ function debugDotnetTest(
     });
 
     child.stderr?.on('data', (text: string) => {
-      logChunk('stderr', text);
+      logChunk(ctx.capture, 'stderr', text);
       appendOutput(run, text);
     });
     child.on('error', err => settle(err));

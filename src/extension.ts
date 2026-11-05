@@ -777,7 +777,9 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
           cache.save();
         }
       } catch (err) {
-        if (cts.token.isCancellationRequested) {
+        // In the legacy mode the listing *is* discovery, so a failure must reach
+        // the outer handler instead of leaving a session with no tests.
+        if (cts.token.isCancellationRequested || !preferSourceScan) {
           throw err;
         }
         log(

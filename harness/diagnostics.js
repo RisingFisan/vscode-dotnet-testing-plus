@@ -163,7 +163,7 @@ console.log('log window vs artifact');
 
 test('the log channel keeps long chunks and the recent window stays bounded', () => {
   const text = 'z'.repeat(1000);
-  logChunk('stdout', text);
+  logChunk(undefined, 'stdout', text);
   assert.strictEqual(outputLines[outputLines.length - 1].split(' ').slice(2).join(' '), text);
   const recent = recentLogLines(1)[0];
   assert.ok(recent.includes('z'.repeat(1000)), 'under the cap, the recent window is lossless');
@@ -171,12 +171,10 @@ test('the log channel keeps long chunks and the recent window stays bounded', ()
 
 test('more than 500 output events stay recoverable in the artifact', () => {
   const capture = beginCapture();
-  setRunCapture(capture);
   const lines = 1000;
   for (let i = 0; i < lines; i += 1) {
-    logChunk('stdout', `line ${String(i).padStart(4, '0')} ${'y'.repeat(200)}\n`);
+    logChunk(capture, 'stdout', `line ${String(i).padStart(4, '0')} ${'y'.repeat(200)}\n`);
   }
-  setRunCapture(undefined);
   capture.finish(CaptureStatus.Failed);
   const written = read(path.join(capture.directory, 'stdout.log')).split('\n').filter(Boolean);
   assert.strictEqual(written.length, lines, 'every event is in the artifact');
@@ -202,14 +200,14 @@ test('run log lines land in run.log only while a capture is active', () => {
 test('a huge chunk keeps the artifact whole while the channel preview is capped', () => {
   const text = 'h'.repeat(100 * 1024);
   const capture = beginCapture();
-  setRunCapture(capture);
-  logChunk('stderr', text);
-  setRunCapture(undefined);
+  logChunk(capture, 'stderr', text);
   capture.finish(CaptureStatus.Failed);
   assert.strictEqual(read(path.join(capture.directory, 'stderr.log')), text);
   const logged = outputLines[outputLines.length - 1];
   assert.ok(logged.includes('chars omitted'), 'channel says it was capped');
-  assert.ok(logged.includes(capture.directory), 'and where the rest lives');
+  // The run id survives promotion and is not a staging path that disappears.
+  assert.ok(logged.includes(`${capture.runId}/stderr.log`), 'and names the artifact by run');
+  assert.ok(!logged.includes(capture.directory), 'never a staging path that later vanishes');
   capture.discard();
 });
 
