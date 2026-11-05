@@ -26,6 +26,8 @@ export interface ScreenshotTest {
   label: string;
   state: ScreenshotState;
   durationMs?: number;
+  /** False when the test came from the source scan and no listing confirmed it. */
+  verified?: boolean;
 }
 
 export interface ScreenshotGroup {
@@ -52,6 +54,8 @@ export interface ScreenshotSessionData {
   states: ReadonlyMap<string, TestResultState>;
   durations: ReadonlyMap<string, number>;
   projects: ReadonlyMap<string, string>;
+  /** FQNs confirmed by a test-host listing; absent when no listing has run. */
+  verified?: ReadonlySet<string>;
 }
 
 function stateForExport(state: TestResultState | undefined): ScreenshotState {
@@ -139,7 +143,8 @@ export function buildScreenshotSnapshot(data: ScreenshotSessionData[], options: 
       kind: 'test',
       label: entry.testName ?? entry.fullyQualifiedName.slice(entry.fullyQualifiedName.lastIndexOf('.') + 1),
       state,
-      durationMs: session.durations.get(entry.fullyQualifiedName)
+      durationMs: session.durations.get(entry.fullyQualifiedName),
+      verified: session.verified ? session.verified.has(entry.fullyQualifiedName) : undefined
     });
     let children: ScreenshotNode[];
     if (options.groupBy === 'test') {

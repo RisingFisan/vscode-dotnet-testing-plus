@@ -46,6 +46,11 @@
           "default": true,
           "description": "When debugging, automatically continue past the test host's initial Debugger.Break() (triggered by VSTEST_HOST_DEBUG) so the run starts without a manual Continue."
         },
+        "dotnetTestingPlus.discovery.preferSourceScan": {
+          "type": "boolean",
+          "default": true,
+          "description": "Discover tests from source and show them immediately, instead of waiting for `dotnet test --list-tests` (which builds the whole solution). Tests become 'verified' once a test-host listing has run; until then they are shown as unverified. Turn this off to restore the previous behaviour, where no tests appear until the test host reports."
+        },
         "dotnetTestingPlus.controlApiEnabled": {
           "type": "boolean",
           "default": false,

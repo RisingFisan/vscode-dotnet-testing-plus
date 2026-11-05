@@ -77,9 +77,13 @@ function runListTests(
   slnPath: string,
   token: vscode.CancellationToken | undefined,
   terminalLoggerOff: boolean,
-  onProgress?: DiscoveryProgressCallback
+  onProgress?: DiscoveryProgressCallback,
+  noBuild = false
 ): Promise<RunListTestsResult> {
   const args = ['test', slnPath, '--list-tests', '--nologo', '-v', 'q'];
+  if (noBuild) {
+    args.push('--no-build');
+  }
   if (terminalLoggerOff) {
     args.push('--tl:off');
   }
@@ -126,7 +130,7 @@ function runListTests(
       }
     };
 
-    const child = spawnTracked('dotnet', args);
+    const child = spawnTracked('dotnet', args, { cwd: path.dirname(slnPath) });
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
 
@@ -241,7 +245,8 @@ const UNSUPPORTED_TL_RE = /--tl\b|MSB1001|unrecogni[sz]ed|unknown (?:option|swit
 export async function discoverSolutionTests(
   slnPath: string,
   token?: vscode.CancellationToken,
-  onProgress?: DiscoveryProgressCallback
+  onProgress?: DiscoveryProgressCallback,
+  noBuild = false
 ): Promise<string[]> {
   let result: RunListTestsResult | undefined;
   let lastError: unknown;
@@ -249,7 +254,7 @@ export async function discoverSolutionTests(
 
   for (let attempt = 1; attempt <= ENOENT_RETRIES; attempt++) {
     try {
-      result = await runListTests(slnPath, token, terminalLoggerOff, onProgress);
+      result = await runListTests(slnPath, token, terminalLoggerOff, onProgress, noBuild);
       lastError = undefined;
       break;
     } catch (err) {

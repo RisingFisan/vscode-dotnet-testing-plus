@@ -66,6 +66,13 @@ export interface ControlApiTest {
   durationMs?: number;
   file?: string;
   line?: number;
+  /**
+   * Whether a test-host listing confirmed this test. `undefined` when no
+   * listing has run yet (or the legacy discovery path is in use). Tests are
+   * discovered from source, so `false` means "found in source, not yet
+   * confirmed by the test host".
+   */
+  verified?: boolean;
 }
 
 export interface ControlApiRunResult {

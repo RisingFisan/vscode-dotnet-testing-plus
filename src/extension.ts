@@ -70,6 +70,12 @@ interface SolutionSession {
   key: string;
   solutionPath: string;
   knownTests?: Set<string>;
+  /**
+   * Subset of `knownTests` that a test-host listing confirmed. Undefined until
+   * such a listing has run: the scan alone cannot tell a real test from a
+   * `[TestMethod]` the compiler never compiled in.
+   */
+  verifiedTests?: ReadonlySet<string>;
   playlistPath?: string;
   playlist?: ParsedPlaylist;
   playlistExpansion?: PlaylistExpansionCache;
@@ -382,6 +388,21 @@ async function pickLoadedSession(
   return picked?.session;
 }
 
+/**
+ * Whether discovery may trust `--no-build`: the last build must have covered
+ * every test project the scan knows about, and no build input may have changed
+ * since. The sweep — not the watcher — is the evidence, so solutions outside a
+ * workspace folder are covered too.
+ */
+async function canSkipBuild(solutionPath: string): Promise<boolean> {
+  const session = sessions.get(solutionPath);
+  const projects = session ? [...new Set(session.testProjects.values())] : [];
+  const state = await checkBuild(solutionPath, projects);
+  if (state === 'inputs') {
+    log(`Build inputs changed since the last build of ${path.basename(solutionPath)}; building again.`);
+  }
+  return state === 'current';
+}
 
 /**
  * Manual `dotnet build` for the Rebuild Solution button: for when the skip
@@ -600,6 +621,43 @@ async function selectSession(context: vscode.ExtensionContext, key: string): Pro
   await updateContexts();
 }
 
+/** Union of two test sets, preserving the scan's (authoritative) membership. */
+function mergeTests(scanned: ReadonlySet<string>, listed: Iterable<string>): Set<string> {
+  const merged = new Set(scanned);
+  for (const fqn of listed) {
+    merged.add(fqn);
+  }
+  return merged;
+}
+
+/**
+ * FQNs a test-host listing actually confirmed. A listed bare name can cover
+ * several sibling FQNs, so only a name that maps to exactly one scanned test
+ * proves that test; anything ambiguous stays unverified instead of being
+ * guessed at (on MES that leaves 43 of 3,293 tests unverified, with one known
+ * phantom among them).
+ */
+function verifiedFromListing(
+  listed: ReadonlySet<string>,
+  methodIndex: ReadonlyMap<string, ReadonlySet<string>>
+): Set<string> {
+  const verified = new Set<string>();
+  for (const fqn of listed) {
+    const dot = fqn.lastIndexOf('.');
+    const bare = dot >= 0 ? fqn.slice(dot + 1) : fqn;
+    const candidates = methodIndex.get(bare);
+    if (candidates?.size === 1 && candidates.has(fqn)) {
+      verified.add(fqn);
+    }
+  }
+  return verified;
+}
+
+/** Harness-only export. */
+export const __verifiedFromListingForTest = verifiedFromListing;
+/** Harness-only export. */
+export const __mergeTestsForTest = mergeTests;
+
 async function discover(session: SolutionSession, force: boolean): Promise<void> {
   if (session.discoveryCts) {
     return;
@@ -639,39 +697,87 @@ async function discover(session: SolutionSession, force: boolean): Promise<void>
     // The cached list is keyed on .sln/.csproj mtimes, which a source edit never
     // touches; the scan's FQN set tells us when tests were added or removed.
     const scanFingerprint = fingerprintFqns(locations.keys());
+    // The scan already knows every test's FQN, file and line. A test-host
+    // listing only adds per-test confirmation, so the tree is painted from the
+    // scan before any `dotnet` process runs: loading a solution no longer waits
+    // on MSBuild.
+    const scanned = new Set(locations.keys());
+    const preferSourceScan = vscode.workspace
+      .getConfiguration()
+      .get<boolean>('dotnetTestingPlus.discovery.preferSourceScan', true);
+    if (preferSourceScan) {
+      session.message = undefined;
+      session.verifiedTests = undefined;
+      session.knownTests = scanned;
+      session.discoveredCount = undefined;
+      session.treeDirty = true;
+      renderTree();
+      await updateContexts();
+    }
+
     const cached = force ? undefined : cache.get(session.solutionPath, cachePaths, parserVersion, scanFingerprint);
     if (cached && cached.length > 0) {
-      session.knownTests = new Set(cached);
-      log(`Using cached test list for ${session.solutionPath} (${cached.length} tests)`);
-    } else {
-      const discoveredNames = await discoverSolutionTests(
-        session.solutionPath,
-        cts.token,
-        count => {
-          session.discoveredCount = count;
-          session.message = `Finding tests... (${count} found)`;
-          session.treeDirty = true;
-          renderTree();
-          void updateViewState();
-        }
+      session.knownTests = preferSourceScan ? mergeTests(scanned, cached) : new Set(cached);
+      session.verifiedTests = preferSourceScan ? verifiedFromListing(new Set(cached), methodIndex) : undefined;
+      log(
+        `Using cached test list for ${session.solutionPath} (${cached.length} confirmed, ${session.knownTests.size} scanned)`
       );
-      const tests = new Set<string>();
-      let unmapped = 0;
-      for (const name of discoveredNames) {
-        const fqns = methodIndex.get(stripTestParameters(name));
-        if (fqns?.size) {
-          fqns.forEach(fqn => tests.add(fqn));
-        } else {
-          unmapped++;
-          tests.add(name);
+    } else if (!preferSourceScan || await canSkipBuild(session.solutionPath)) {
+      // Reconcile against the test host. `--no-build` is only trustworthy when
+      // this window has seen a successful build since the sources last changed
+      // (`buildState`); otherwise the outputs may be missing or stale and a
+      // "no such test" answer would be worse than no answer.
+      //
+      // Confirmation is optional by design: the tree is already painted from
+      // the scan, so a failed listing must not be reported as a discovery
+      // failure. It only leaves the tests unverified.
+      try {
+        const discoveredNames = await discoverSolutionTests(
+          session.solutionPath,
+          cts.token,
+          count => {
+            session.discoveredCount = count;
+            session.message = `Confirming tests... (${count} found)`;
+            session.treeDirty = true;
+            renderTree();
+            void updateViewState();
+          },
+          preferSourceScan
+        );
+        const listed = new Set<string>();
+        let unmapped = 0;
+        for (const name of discoveredNames) {
+          const fqns = methodIndex.get(stripTestParameters(name));
+          if (fqns?.size) {
+            fqns.forEach(fqn => listed.add(fqn));
+          } else {
+            unmapped++;
+            listed.add(name);
+          }
         }
+        log(
+          `Confirmed ${listed.size - unmapped} tests against the test host (${unmapped} unmapped) in ${path.basename(session.solutionPath)}`
+        );
+        session.knownTests = mergeTests(scanned, listed);
+        session.verifiedTests = verifiedFromListing(listed, methodIndex);
+        if (listed.size > 0) {
+          cache.set(session.solutionPath, cachePaths, [...listed], parserVersion, scanFingerprint);
+          cache.save();
+        }
+      } catch (err) {
+        if (cts.token.isCancellationRequested) {
+          throw err;
+        }
+        log(
+          `Test-host confirmation skipped for ${session.solutionPath} (tests stay unverified): ` +
+            `${err instanceof Error ? err.message : String(err)}`
+        );
       }
-      log(`Mapped ${tests.size - unmapped} tests to fully-qualified names (${unmapped} unmapped) in ${path.basename(session.solutionPath)}`);
-      session.knownTests = tests;
-      if (tests.size > 0) {
-        cache.set(session.solutionPath, cachePaths, [...tests], parserVersion, scanFingerprint);
-        cache.save();
-      }
+    } else {
+      log(
+        `Showing scan results for ${session.solutionPath} without test-host confirmation ` +
+          '(no build in this window yet; a run or build will confirm them)'
+      );
     }
     session.discoveredCount = undefined;
     session.message = undefined;
@@ -1229,7 +1335,8 @@ function controlApiTests(solutionId: string): ControlApiTest[] {
       state: session.testResultStates.get(fqn) ?? 'notRun',
       durationMs: duration,
       file: location?.file,
-      line: location?.line
+      line: location?.line,
+      verified: session.verifiedTests ? session.verifiedTests.has(fqn) : undefined
     });
   }
   return tests;
@@ -1793,7 +1900,8 @@ function requestScreenshotPreview(settings: ScreenshotExportSettings): void {
         entries: entriesForSession(session),
         states: session.testResultStates,
         durations: session.testDurations,
-        projects: session.testProjects
+        projects: session.testProjects,
+        verified: session.verifiedTests
       })),
     screenshotOptions(settings)
   );
@@ -1852,7 +1960,8 @@ function apiScreenshotSnapshot(settings: unknown): ScreenshotSnapshot {
       entries,
       states: session.testResultStates,
       durations: session.testDurations,
-      projects: session.testProjects
+      projects: session.testProjects,
+      verified: session.verifiedTests
     });
   }
   return buildScreenshotSnapshot(data, {
