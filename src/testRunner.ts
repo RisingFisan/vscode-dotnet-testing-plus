@@ -11,6 +11,8 @@ import { killProcessTree, spawnTracked } from './processTree';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 import { collectProjectCoverage, CoverageState, newCoverageState } from './coverage';
+import { checkBuild, getBuildStamp, markBuildClean, markBuildDirty } from './buildState';
+import { summarizeBuildInputs } from './buildInputs';
 import { CaptureKind, CaptureStatus, RunDiagnosticsStore } from './runDiagnostics';
 import { asArray } from './util';
 
@@ -53,6 +55,8 @@ interface RunOptions {
   solutionPath?: string;
   /** Durable diagnostics store; undefined leaves artifacts unstaged. */
   diagnostics?: RunDiagnosticsStore;
+  /** Where generated solution filters live; undefined always builds the whole solution. */
+  slicesDir?: string;
   locations?: Map<string, SourceLocation>;
   /** FQN -> owning .csproj path. When provided, tests are run per project. */
   projects?: Map<string, string>;
@@ -271,9 +275,43 @@ async function runSolutionTests(
   if (groups.size === 0) {
     return;
   }
-  const solutionOptions: RunOptions = { ...options, runsettingsPath: solution.runsettingsPath };
+  const projectPaths = [...groups.keys()];
+  const solutionOptions: RunOptions = {
+    ...options,
+    solutionPath: solution.solutionPath,
+    runsettingsPath: solution.runsettingsPath
+  };
   try {
-    await buildSolutionOnce(solution.solutionPath, run, token);
+    const state = await checkBuild(solution.solutionPath, projectPaths);
+    if (state === 'current') {
+      const message = `Skipping build (nothing changed since the last build): ${solution.solutionPath}`;
+      log(message);
+      appendOutput(run, message + '\n');
+    } else {
+      // A coverage-only miss means the previous build's inputs are still valid,
+      // so the projects it already covered stay covered.
+      const previous = state === 'coverage' ? getBuildStamp(solution.solutionPath)?.projects : undefined;
+      const builtAt = Date.now();
+      const { fullSolution } = await buildSolutionOnce(
+        solution.solutionPath,
+        projectPaths,
+        run,
+        token,
+        options?.diagnostics,
+        options?.slicesDir
+      );
+      const summary = await summarizeBuildInputs(solution.solutionPath);
+      if (summary) {
+        const built = projectPaths.map(project => path.resolve(project));
+        markBuildClean(solution.solutionPath, {
+          ...summary,
+          builtAt,
+          projects: fullSolution ? null : [...new Set([...(previous ?? []), ...built])]
+        });
+      } else {
+        markBuildDirty(solution.solutionPath);
+      }
+    }
   } catch (err) {
     if (token.isCancellationRequested) {
       throw err;
@@ -722,16 +760,94 @@ function createLineFeeder(ctx: LiveContext, resultFiles: string[]): LineFeeder {
 // ("The argument <dll> is invalid"). Build and test must always agree.
 const BUILD_CONFIGURATION = 'Debug';
 
-function buildSolutionOnce(
-  solutionPath: string,
-  run: vscode.TestRun,
-  token: vscode.CancellationToken
+export type BuildOutput = (text: string, stream: 'stdout' | 'stderr') => void;
+
+/**
+ * Environment for spawned `dotnet` processes. The first-run banner and
+ * telemetry are pure startup cost, and neither belongs in a test run's output.
+ */
+function dotnetEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return { ...process.env, DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1', ...extra };
+}
+
+/** How much of a failed build's output is inspected to classify the failure. */
+const BUILD_OUTPUT_TAIL_CHARS = 4000;
+/**
+ * A build without an implicit restore fails this way when the assets in `obj/`
+ * are missing or stale (branch switch, cleared NuGet cache, new project, or
+ * assets written by a different OS with foreign package folders). That is the
+ * only case worth paying for a restore.
+ */
+const MISSING_ASSETS_RE = /NETSDK1004|project\.assets\.json[^\n]*not found|Run a NuGet package restore|Unable to find fallback package folder/i;
+
+interface BuildAttempt {
+  exitCode: number;
+  /** Tail of the combined output, for classifying a failure. */
+  outputTail: string;
+}
+
+/**
+ * Runs `dotnet build` for `target` (a solution or a generated solution filter),
+ * resolving the SDK and NuGet configuration from `buildCwd`. `onOutput` receives
+ * raw stdout/stderr chunks as the process emits them.
+ *
+ * Builds run with `--no-restore`: a restore that has nothing to do still costs
+ * several seconds on a large solution (measured ~6.5 s of a 23 s no-change
+ * build). Only a genuine "assets are missing/stale" failure is retried with the
+ * implicit restore, so normal runs never pay for it and stale assets still work.
+ */
+async function buildTarget(
+  target: string,
+  buildCwd: string,
+  token: vscode.CancellationToken,
+  onOutput: BuildOutput
 ): Promise<void> {
-  const args = ['build', solutionPath, '-c', BUILD_CONFIGURATION, '--nologo', '--tl:off'];
+  const restoreArgs = ['build', target, '-c', BUILD_CONFIGURATION, '--nologo', '--tl:off', '-v', 'q'];
+  const attempt = await runBuild(restoreArgs.concat('--no-restore'), target, buildCwd, token, onOutput);
+  if (attempt.exitCode === 0) {
+    return;
+  }
+  if (token.isCancellationRequested || !MISSING_ASSETS_RE.test(attempt.outputTail)) {
+    throw new Error(`dotnet build failed with exit code ${attempt.exitCode}`);
+  }
+  log('[build] assets are missing or stale: retrying with an implicit restore');
+  onOutput('Restore assets are missing or stale; retrying the build with an implicit restore.\n', 'stdout');
+  const retry = await runBuild(restoreArgs, target, buildCwd, token, onOutput);
+  if (retry.exitCode !== 0) {
+    throw new Error(`dotnet build failed with exit code ${retry.exitCode}`);
+  }
+}
+
+/** Runs `dotnet build` for a solution (the whole thing). */
+export function buildSolution(
+  solutionPath: string,
+  token: vscode.CancellationToken,
+  onOutput: BuildOutput
+): Promise<void> {
+  return buildTarget(solutionPath, path.dirname(solutionPath), token, onOutput);
+}
+
+function runBuild(
+  args: string[],
+  target: string,
+  buildCwd: string,
+  token: vscode.CancellationToken,
+  onOutput: BuildOutput
+): Promise<BuildAttempt> {
   logCommand('dotnet', args);
-  appendOutput(run, `Building solution: ${solutionPath}\n`);
+  onOutput(`Building ${target}\n`, 'stdout');
   return new Promise((resolve, reject) => {
-    const child: ChildProcess = spawnTracked('dotnet', args);
+    // The SDK and NuGet configuration are resolved from the working directory,
+    // so it must be the solution's, not the extension host's (nor the slice's).
+    const child: ChildProcess = spawnTracked('dotnet', args, {
+      cwd: buildCwd,
+      env: dotnetEnv()
+    });
+    let outputTail = '';
+    const record = (text: string, stream: 'stdout' | 'stderr'): void => {
+      outputTail = (outputTail + text).slice(-BUILD_OUTPUT_TAIL_CHARS);
+      onOutput(text, stream);
+    };
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
     const cancelSub = token.onCancellationRequested(() => {
@@ -739,8 +855,8 @@ function buildSolutionOnce(
       killProcessTree(child);
       reject(new Error('Build cancelled'));
     });
-    child.stdout?.on('data', (text: string) => appendOutput(run, text));
-    child.stderr?.on('data', (text: string) => appendOutput(run, text));
+    child.stdout?.on('data', (text: string) => record(text, 'stdout'));
+    child.stderr?.on('data', (text: string) => record(text, 'stderr'));
     child.on('error', err => {
       cancelSub.dispose();
       log(`[error] dotnet build failed: ${err.message}`);
@@ -748,11 +864,7 @@ function buildSolutionOnce(
     });
     child.on('exit', code => {
       cancelSub.dispose();
-      if (code !== 0) {
-        reject(new Error(`dotnet build failed with exit code ${code}`));
-      } else {
-        resolve();
-      }
+      resolve({ exitCode: code ?? 1, outputTail });
     });
     if (token.isCancellationRequested) {
       cancelSub.dispose();
@@ -760,6 +872,86 @@ function buildSolutionOnce(
       reject(new Error('Build cancelled'));
     }
   });
+}
+
+/**
+ * Builds the projects a run needs. A subset is built through a generated
+ * solution filter, which keeps MSBuild's project graph and solution ordering
+ * while skipping the projects that cannot affect these tests (measured 7-8 s
+ * vs 14-20 s for the whole solution). Falls back to the whole solution when no
+ * slice can be written.
+ */
+async function prepareBuildTarget(
+  solutionPath: string,
+  projects: readonly string[],
+  slicesDir: string | undefined
+): Promise<{ target: string; fullSolution: boolean }> {
+  if (!slicesDir || projects.length === 0) {
+    return { target: solutionPath, fullSolution: true };
+  }
+  const solutionDir = path.dirname(solutionPath);
+  const relative = projects.map(project => path.relative(solutionDir, project).split(path.sep).join('/'));
+  if (relative.some(project => project.startsWith('..'))) {
+    // A project outside the solution's directory cannot be named by a filter.
+    return { target: solutionPath, fullSolution: true };
+  }
+  try {
+    const key = crypto.createHash('sha1').update([solutionPath, ...relative].join('\n')).digest('hex').slice(0, 12);
+    const file = path.join(slicesDir, `slice-${key}.slnf`);
+    const content = JSON.stringify({ solution: { path: solutionPath, projects: relative } }, null, 2) + '\n';
+    await fs.promises.mkdir(slicesDir, { recursive: true });
+    const existing = await fs.promises.readFile(file, 'utf8').catch(() => undefined);
+    if (existing !== content) {
+      await fs.promises.writeFile(file, content);
+    }
+    return { target: file, fullSolution: false };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`[build] cannot write a solution filter (${message}); building the whole solution`);
+    return { target: solutionPath, fullSolution: true };
+  }
+}
+
+/**
+ * Build what a test run needs, capturing the output so a failed build keeps the
+ * compiler output that explains it. A passing build is staged and then
+ * discarded like a passing test run.
+ */
+async function buildSolutionOnce(
+  solutionPath: string,
+  projects: readonly string[],
+  run: vscode.TestRun,
+  token: vscode.CancellationToken,
+  diagnostics?: RunDiagnosticsStore,
+  slicesDir?: string
+): Promise<{ fullSolution: boolean }> {
+  const { target, fullSolution } = await prepareBuildTarget(solutionPath, projects, slicesDir);
+  const capture = diagnostics?.begin({
+    kind: CaptureKind.Build,
+    solutionPath,
+    command: ['dotnet', 'build', target, '-c', BUILD_CONFIGURATION, '--nologo', '--tl:off', '-v', 'q', '--no-restore']
+  });
+  setRunCapture(capture);
+  let status = CaptureStatus.Passed;
+  try {
+    await buildTarget(target, path.dirname(solutionPath), token, (text, stream) => {
+      capture?.append(`${stream}.log`, text);
+      appendOutput(run, text);
+    });
+  } catch (err) {
+    status = token.isCancellationRequested ? CaptureStatus.Cancelled : CaptureStatus.Failed;
+    throw err;
+  } finally {
+    setRunCapture(undefined);
+    if (status === CaptureStatus.Failed) {
+      capture?.addFailures(1);
+    }
+    const retained = diagnostics?.settle(capture, status, status !== CaptureStatus.Passed);
+    if (retained) {
+      log(`Build diagnostics retained: ${retained}`);
+    }
+  }
+  return { fullSolution };
 }
 
 async function runChunk(
@@ -823,8 +1015,8 @@ async function runChunk(
 
   try {
     resultFiles = debug
-      ? await debugDotnetTest(args, run, token, ctx, streamLogPath)
-      : await runDotnetTest(args, run, token, ctx, streamLogPath);
+      ? await debugDotnetTest(args, path.dirname(target), run, token, ctx, streamLogPath)
+      : await runDotnetTest(args, path.dirname(target), run, token, ctx, streamLogPath);
     stopTailer?.();
     // Pending TRX parses scheduled while streaming must settle before the
     // sweep decides what is left.
@@ -954,6 +1146,7 @@ function whenStdoutDrained(child: ChildProcess, callback: () => void): void {
 
 function runDotnetTest(
   args: string[],
+  cwd: string,
   run: vscode.TestRun,
   token: vscode.CancellationToken,
   ctx: LiveContext,
@@ -968,7 +1161,8 @@ function runDotnetTest(
     const feeder = createLineFeeder(ctx, resultFiles);
     let sawStdout = false;
     const child: ChildProcess = spawnTracked('dotnet', args, {
-      env: streamLogPath ? { ...process.env, PLAYLIST_STREAM_LOG: streamLogPath } : process.env
+      cwd,
+      env: dotnetEnv(streamLogPath ? { PLAYLIST_STREAM_LOG: streamLogPath } : {})
     });
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
@@ -1015,6 +1209,7 @@ function runDotnetTest(
 
 function debugDotnetTest(
   args: string[],
+  cwd: string,
   run: vscode.TestRun,
   token: vscode.CancellationToken,
   ctx: LiveContext,
@@ -1026,11 +1221,11 @@ function debugDotnetTest(
   }
   return new Promise((resolve, reject) => {
     const child: ChildProcess = spawnTracked('dotnet', args, {
-      env: {
-        ...process.env,
+      cwd,
+      env: dotnetEnv({
         VSTEST_HOST_DEBUG: '1',
         ...(streamLogPath ? { PLAYLIST_STREAM_LOG: streamLogPath } : {})
-      }
+      })
     });
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
@@ -1279,4 +1474,5 @@ export const __batchByFilterLengthForTest = batchByFilterLength;
 export const __createLiveContextForTest = createLiveContext;
 export const __reportMatchedResultsForTest = reportMatchedResults;
 export const __startStreamTailerForTest = startStreamTailer;
+export const __prepareBuildTargetForTest = prepareBuildTarget;
 export const __runSolutionTestsForTest = runSolutionTests;

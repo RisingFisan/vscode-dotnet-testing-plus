@@ -120,6 +120,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "dotnet-testing-plus.rebuildSolution",
+        "title": "Rebuild Solution",
+        "category": ".NET Testing+",
+        "icon": "$(tools)"
+      },
+      {
         "command": "dotnet-testing-plus.clearPlaylist",
         "title": "Clear Playlist",
         "category": ".NET Testing+",
@@ -219,6 +225,11 @@
           "command": "dotnet-testing-plus.refresh",
           "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.hasSolution && !dotnetTestingPlus.solutionLoading",
           "group": "navigation@2"
+        },
+        {
+          "command": "dotnet-testing-plus.rebuildSolution",
+          "when": "view == dotnet-testing-plus.view && dotnetTestingPlus.hasSolution && !dotnetTestingPlus.solutionLoading",
+          "group": "navigation@3"
         },
         {
           "command": "dotnet-testing-plus.showOutput",

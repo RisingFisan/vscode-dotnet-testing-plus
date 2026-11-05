@@ -3,7 +3,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { parsePlaylist, serializePlaylist, expandPlaylist, entryFromKnownTestFqn, ParsedPlaylist, PlaylistSaveFormat, PlaylistTest } from './playlistParser';
-import { runPlaylistTests, SolutionRunOptions, TestDescriptor, TestFailureLocations } from './testRunner';
+import { buildSolution, runPlaylistTests, SolutionRunOptions, TestDescriptor, TestFailureLocations } from './testRunner';
+import { checkBuild, markBuildClean, markBuildDirty, configureBuildState } from './buildState';
+import { summarizeBuildInputs } from './buildInputs';
 import { SolutionCache } from './cache';
 import { fingerprintFqns } from './fileScanCache';
 import { killAllTrackedChildren } from './processTree';
@@ -121,6 +123,10 @@ let searchAllSolutions = false;
 const activeRuns = new Set<vscode.CancellationTokenSource>();
 // Solutions with a run in flight: a second run on the same solution is refused.
 const runningSolutions = new Set<string>();
+// Solutions with a manual rebuild in flight; a solution can't run tests and
+// rebuild at once (both spawn processes touching bin/obj), so rebuilds also
+// register in `runningSolutions`.
+const rebuildingSolutions = new Set<string>();
 let apiCoordinator: ApiCoordinator | undefined;
 // Serialized payload of the last SSE state broadcast; identical states skip the broadcast.
 let lastBroadcastState: string | undefined;
@@ -138,6 +144,7 @@ export function activate(context: vscode.ExtensionContext): void {
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
   cache = new SolutionCache(context.globalStorageUri.fsPath);
+  configureBuildState(path.join(context.globalStorageUri.fsPath, 'build-stamps.json'));
   runDiagnostics = new RunDiagnosticsStore(path.join(diagnosticsRoot(), 'diagnostics'), readDiagnosticsRetention());
   context.subscriptions.push(controller);
 
@@ -204,6 +211,12 @@ export function activate(context: vscode.ExtensionContext): void {
         await refreshSolution(session);
       }
     }),
+    vscode.commands.registerCommand('dotnet-testing-plus.rebuildSolution', async () => {
+      const session = await pickLoadedSession('Select a solution to rebuild');
+      if (session) {
+        await rebuildSolutionNow(session.solutionPath);
+      }
+    }),
     vscode.commands.registerCommand('dotnet-testing-plus.showOutput', () => showLog()),
     vscode.commands.registerCommand('dotnet-testing-plus.runAll', () => runAllTests(false)),
     vscode.commands.registerCommand('dotnet-testing-plus.debugAll', () => runAllTests(true)),
@@ -216,6 +229,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dotnet-testing-plus.installAgentSkill', () => installAgentSkill(extensionPath)),
     vscode.commands.registerCommand('dotnet-testing-plus.showRunDiagnostics', () => showRunDiagnostics()),
     vscode.commands.registerCommand('dotnet-testing-plus.clearRunDiagnostics', () => clearRunDiagnostics()),
+    // Compiler-visible file changes invalidate the solutions' build-skip flag.
+    startBuildWatcher(),
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('dotnetTestingPlus.skipPreBreakpoint')) {
         void updateContexts();
@@ -257,6 +272,64 @@ export function deactivate(): void {
 
 function canonicalPath(file: string): string {
   return path.resolve(file);
+}
+
+/** Whether `file` resolves inside directory `dir` (path.relative, not a prefix compare). */
+function pathContains(dir: string, file: string): boolean {
+  const relative = path.relative(dir, file);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/** Directories whose contents never affect a build (and churn on every one). */
+const IGNORED_BUILD_SEGMENTS = new Set(['bin', 'obj', 'TestResults', 'node_modules']);
+/** MSBuild/NuGet files that apply to a solution from an ancestor directory. */
+const SHARED_BUILD_FILES = new Set([
+  'Directory.Build.props',
+  'Directory.Build.targets',
+  'Directory.Packages.props',
+  'global.json',
+  'nuget.config'
+]);
+
+function isIgnoredBuildPath(file: string): boolean {
+  return file.split(path.sep).some(segment => IGNORED_BUILD_SEGMENTS.has(segment));
+}
+
+/** Whether `file` is one of the shared MSBuild/NuGet files inherited by `solutionDir`. */
+function isSharedBuildFile(solutionDir: string, file: string): boolean {
+  return SHARED_BUILD_FILES.has(path.basename(file)) && pathContains(path.dirname(file), solutionDir);
+}
+
+/**
+ * Records which solutions may still be up to date. Watcher events are only a
+ * fast path: `canSkipBuild` re-checks the inputs, so a missed event (solution
+ * outside the workspace, watcher limits) can never produce a stale build.
+ * Build output folders are ignored, because the build itself rewrites them.
+ */
+function startBuildWatcher(): vscode.Disposable {
+  const dirty = (uri: vscode.Uri): void => {
+    if (isIgnoredBuildPath(uri.fsPath)) {
+      return;
+    }
+    for (const session of sessions.values()) {
+      const solutionDir = path.dirname(session.solutionPath);
+      if (pathContains(solutionDir, uri.fsPath) || isSharedBuildFile(solutionDir, uri.fsPath)) {
+        markBuildDirty(session.solutionPath);
+      }
+    }
+  };
+  const sources = vscode.workspace.createFileSystemWatcher('**/*.{cs,csproj,props,targets,xaml,resx}');
+  const lock = vscode.workspace.createFileSystemWatcher('**/packages.lock.json');
+  const solutions = vscode.workspace.createFileSystemWatcher('**/*.{sln,slnf,slnx}');
+  const shared = vscode.workspace.createFileSystemWatcher(
+    '**/{Directory.Build.props,Directory.Build.targets,Directory.Packages.props,global.json,nuget.config}'
+  );
+  const watchers = [sources, lock, solutions, shared];
+  const disposables: vscode.Disposable[] = [...watchers];
+  for (const watcher of watchers) {
+    disposables.push(watcher.onDidChange(dirty), watcher.onDidCreate(dirty), watcher.onDidDelete(dirty));
+  }
+  return vscode.Disposable.from(...disposables);
 }
 
 function createSession(saved: PersistedSession): SolutionSession {
@@ -307,6 +380,77 @@ async function pickLoadedSession(
     { placeHolder }
   );
   return picked?.session;
+}
+
+
+/**
+ * Manual `dotnet build` for the Rebuild Solution button: for when the skip
+ * logic considers the solution clean but the binaries are missing or stale
+ * (wiped bin/obj, a build elsewhere with different properties).
+ */
+async function rebuildSolutionNow(solutionPath: string): Promise<void> {
+  const name = path.basename(solutionPath);
+  if (runningSolutions.has(solutionPath) || rebuildingSolutions.has(solutionPath)) {
+    vscode.window.showInformationMessage(
+      runningSolutions.has(solutionPath)
+        ? `A test run is already in progress for ${name}. Wait for it to finish or cancel it first.`
+        : `A rebuild is already in progress for ${name}.`
+    );
+    return;
+  }
+  rebuildingSolutions.add(solutionPath);
+  runningSolutions.add(solutionPath);
+  try {
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Rebuilding ${name}…`, cancellable: true },
+      async (_progress, progressToken) => {
+        let pending = '';
+        const logOutput = (text: string): void => {
+          pending += text;
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() ?? '';
+          lines.forEach(line => log(line));
+        };
+        const flushLogOutput = (): void => {
+          if (pending.length > 0) {
+            log(pending);
+            pending = '';
+          }
+        };
+        const cts = new vscode.CancellationTokenSource();
+        progressToken.onCancellationRequested(() => cts.cancel());
+        activeRuns.add(cts);
+        // A cancelled or failed rebuild can leave partial outputs behind, so
+        // the skip flag is re-earned by a future successful build.
+        markBuildDirty(solutionPath);
+        const builtAt = Date.now();
+        try {
+          await buildSolution(solutionPath, cts.token, logOutput);
+          const summary = await summarizeBuildInputs(solutionPath);
+          if (summary) {
+            markBuildClean(solutionPath, { ...summary, builtAt, projects: null });
+          }
+          log(`Rebuild finished: ${solutionPath}`);
+          void vscode.window.showInformationMessage(`Solution built: ${name}.`);
+        } catch (err) {
+          if (cts.token.isCancellationRequested) {
+            log('Rebuild cancelled');
+          } else {
+            const message = err instanceof Error ? err.message : String(err);
+            log(`[error] rebuild failed: ${message}`);
+            void vscode.window.showErrorMessage(`Rebuild of ${name} failed: ${message}`);
+          }
+        } finally {
+          flushLogOutput();
+          activeRuns.delete(cts);
+          cts.dispose();
+        }
+      }
+    );
+  } finally {
+    rebuildingSolutions.delete(solutionPath);
+    runningSolutions.delete(solutionPath);
+  }
 }
 
 function disposeSession(session: SolutionSession): void {
@@ -817,6 +961,7 @@ async function executeSolutionRun(
       loggerDir: extensionPath ? path.join(extensionPath, 'assets', 'logger') : undefined,
       coverage,
       diagnostics: runDiagnostics,
+      slicesDir: extensionContext ? path.join(extensionContext.globalStorageUri.fsPath, 'build-slices') : undefined,
       skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
       onTestFailureLocations: (test, locations) => {
         failureLocations.set(test.id, locations);
