@@ -8,7 +8,7 @@ import * as path from 'path';
  */
 
 /** Top-level path segments the API reserves, so a session/solution id can never shadow a route. */
-const RESERVED_IDS = new Set(['api', 'internal', 'index.html', 'sessions', 'favicon.ico']);
+const RESERVED_IDS = new Set(['api', 'internal', 'index.html', 'sessions', 'runs', 'favicon.ico']);
 
 export function sanitizeApiId(value: string): string {
   const cleaned = value

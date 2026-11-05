@@ -6,11 +6,12 @@ import * as crypto from 'crypto';
 import { ChildProcess } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import { XMLParser } from 'fast-xml-parser';
-import { log, logCommand } from './logger';
+import { log, logCommand, logChunk, setRunCapture } from './logger';
 import { killProcessTree, spawnTracked } from './processTree';
 import { SourceLocation } from './sourceScan';
 import { TestResultState } from './testResultFilter';
 import { collectProjectCoverage, CoverageState, newCoverageState } from './coverage';
+import { CaptureKind, CaptureStatus, RunDiagnosticsStore } from './runDiagnostics';
 import { asArray } from './util';
 
 /**
@@ -48,6 +49,10 @@ export interface SolutionRunOptions {
 
 interface RunOptions {
   runsettingsPath?: string;
+  /** Solution owning the tests being run; recorded in run diagnostics. */
+  solutionPath?: string;
+  /** Durable diagnostics store; undefined leaves artifacts unstaged. */
+  diagnostics?: RunDiagnosticsStore;
   locations?: Map<string, SourceLocation>;
   /** FQN -> owning .csproj path. When provided, tests are run per project. */
   projects?: Map<string, string>;
@@ -515,6 +520,20 @@ function testsForResult(ctx: LiveContext, resultFqn: string): readonly vscode.Te
   return paren > 0 ? index.get(resultFqn.slice(0, paren)) ?? [] : [];
 }
 
+/**
+ * Tests that reported a failing outcome in this chunk. Unreported tests are
+ * skipped by the sweep rather than failed, so they do not count.
+ */
+function countFailures(ctx: LiveContext): number {
+  let failed = 0;
+  for (const outcome of ctx.outcomes.values()) {
+    if (outcome === 'Failed') {
+      failed += 1;
+    }
+  }
+  return failed;
+}
+
 function reportResult(ctx: LiveContext, result: StreamedResult & { fqn: string; outcome: string }): void {
   for (const test of testsForResult(ctx, result.fqn)) {
     reportOutcome(ctx, test, result.outcome, result.durationMs, {
@@ -777,6 +796,19 @@ async function runChunk(
     args.push('--settings', options.runsettingsPath);
   }
 
+  // Diagnostics are staged (not retained) while the chunk runs: only a chunk
+  // that does not pass is promoted, so green runs leave nothing behind.
+  const diagnostics = options?.diagnostics;
+  const capture = diagnostics?.begin({
+    kind: CaptureKind.Tests,
+    solutionPath: options?.solutionPath ?? target,
+    projectPath: target,
+    debug,
+    command: ['dotnet', ...args]
+  });
+  setRunCapture(capture);
+  let status = CaptureStatus.Passed;
+
   const ctx = createLiveContext(run, options, tests);
   let resultFiles: string[] = [];
   const streamLogPath = useStreamLogger
@@ -826,6 +858,7 @@ async function runChunk(
       }
     }
   } catch (err) {
+    status = token.isCancellationRequested ? CaptureStatus.Cancelled : CaptureStatus.Failed;
     // Let in-flight TRX parses report first; only tests with no outcome at
     // all are marked below.
     await ctx.trxQueue;
@@ -843,6 +876,30 @@ async function runChunk(
     }
   } finally {
     stopTailer?.();
+    // A run that did not pass keeps its full diagnostics (stdout, stderr, the
+    // extension log lines, the stream-logger JSONL and every TRX). Cancellation
+    // counts as non-passing: the output is usually why it was cancelled.
+    const failedTests = countFailures(ctx);
+    if (failedTests > 0) {
+      status = status === CaptureStatus.Passed ? CaptureStatus.Failed : status;
+      capture?.addFailures(failedTests);
+    }
+    const keep = status !== CaptureStatus.Passed;
+    if (capture && keep) {
+      if (streamLogPath) {
+        capture.attach(streamLogPath, 'stream.jsonl');
+      }
+      let index = 0;
+      for (const f of new Set([...resultFiles, ...ctx.trxFiles])) {
+        index += 1;
+        capture.attach(f, `results-${index}.trx`);
+      }
+    }
+    setRunCapture(undefined);
+    const retained = diagnostics?.settle(capture, status, keep);
+    if (retained) {
+      log(`Run diagnostics retained: ${retained}`);
+    }
     if (streamLogPath) {
       try {
         fs.rmSync(streamLogPath, { force: true });
@@ -852,6 +909,7 @@ async function runChunk(
     }
     // dotnet test writes the TRX next to the test project; clean up every one
     // we saw, including runs that errored or were cancelled before returning.
+    // Retained runs keep a copy in the diagnostics directory instead.
     for (const f of new Set([...resultFiles, ...ctx.trxFiles])) {
       try {
         fs.rmSync(f, { force: true });
@@ -925,12 +983,12 @@ function runDotnetTest(
 
     child.stdout?.on('data', (text: string) => {
       sawStdout = true;
-      log(`[stdout] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
+      logChunk('stdout', text);
       appendOutput(run, text);
       feeder.feed(text);
     });
     child.stderr?.on('data', (text: string) => {
-      log(`[stderr] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
+      logChunk('stderr', text);
       appendOutput(run, text);
     });
     child.on('error', err => {
@@ -1010,7 +1068,7 @@ function debugDotnetTest(
     }));
 
     child.stdout?.on('data', (text: string) => {
-      log(`[stdout] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
+      logChunk('stdout', text);
       appendOutput(run, text);
       feeder.feed(text);
       if (!attached) {
@@ -1043,7 +1101,7 @@ function debugDotnetTest(
     });
 
     child.stderr?.on('data', (text: string) => {
-      log(`[stderr] ${text.slice(0, 500)}${text.length > 500 ? '\n... (truncated)' : ''}`);
+      logChunk('stderr', text);
       appendOutput(run, text);
     });
     child.on('error', err => settle(err));

@@ -16,6 +16,7 @@ import { SourceLocation } from './sourceScan';
 import { buildMethodIndex } from './astScan';
 import { buildSolutionPlaceholder, buildSolutionTree, testItemId, updateGroupLabels } from './testTree';
 import { initLogger, showLog, log, recentLogLines } from './logger';
+import { DEFAULT_RETENTION, DiagnosticsRetention, RunDiagnosticsStore } from './runDiagnostics';
 import { ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiRunsettingsAction, ControlApiState, ControlApiSseEvent, ControlApiTest } from './controlApi';
 import { ApiCoordinator } from './apiCoordinator';
 import { assignUniqueId, deriveSessionBaseId, solutionIdFromPath } from './apiIds';
@@ -127,6 +128,7 @@ let lastBroadcastState: string | undefined;
 let lastSolutionsSignature: string | undefined;
 let controlApiSessionEnabled = false;
 let codeLenses: CodeLensHandle | undefined;
+let runDiagnostics: RunDiagnosticsStore | undefined;
 const failureLocations = new Map<string, TestFailureLocations>();
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -136,6 +138,7 @@ export function activate(context: vscode.ExtensionContext): void {
   extensionPath = context.extensionPath;
   controller = vscode.tests.createTestController('dotnetTestingPlus', '.NET Testing+');
   cache = new SolutionCache(context.globalStorageUri.fsPath);
+  runDiagnostics = new RunDiagnosticsStore(path.join(diagnosticsRoot(), 'diagnostics'), readDiagnosticsRetention());
   context.subscriptions.push(controller);
 
   mainView = new MainViewProvider(action => void handleViewAction(context, action));
@@ -211,9 +214,14 @@ export function activate(context: vscode.ExtensionContext): void {
       await navigateToFailureLocation(item, 'innermostError');
     }),
     vscode.commands.registerCommand('dotnet-testing-plus.installAgentSkill', () => installAgentSkill(extensionPath)),
+    vscode.commands.registerCommand('dotnet-testing-plus.showRunDiagnostics', () => showRunDiagnostics()),
+    vscode.commands.registerCommand('dotnet-testing-plus.clearRunDiagnostics', () => clearRunDiagnostics()),
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('dotnetTestingPlus.skipPreBreakpoint')) {
         void updateContexts();
+      }
+      if (e.affectsConfiguration('dotnetTestingPlus.diagnostics')) {
+        runDiagnostics?.setRetention(readDiagnosticsRetention());
       }
       if (
         e.affectsConfiguration('dotnetTestingPlus.controlApiEnabled') ||
@@ -808,6 +816,7 @@ async function executeSolutionRun(
       descriptors,
       loggerDir: extensionPath ? path.join(extensionPath, 'assets', 'logger') : undefined,
       coverage,
+      diagnostics: runDiagnostics,
       skipPreBreakpoint: vscode.workspace.getConfiguration('dotnetTestingPlus').get<boolean>('skipPreBreakpoint', true),
       onTestFailureLocations: (test, locations) => {
         failureLocations.set(test.id, locations);
@@ -1288,6 +1297,9 @@ function controlApiHandlers(context: vscode.ExtensionContext): ControlApiHandler
       return true;
     },
     logLines: limit => recentLogLines(limit),
+    listRuns: () => runDiagnostics?.list() ?? [],
+    getRunManifest: runId => runDiagnostics?.manifest(runId),
+    readRunArtifact: (runId, name, offset, limit) => runDiagnostics?.readArtifact(runId, name, offset, limit),
     getScreenshot: settings => apiScreenshotSnapshot(settings),
     getCode: (solutionId, fqn) => {
       const session = resolveApiSolution(solutionId);
@@ -1873,6 +1885,66 @@ function getActiveRunsettings(session: SolutionSession): string | undefined {
 function getCustomRunsettingsStorageDirectory(): string {
   const storageUri = extensionContext?.storageUri ?? extensionContext?.globalStorageUri;
   return storageUri?.fsPath ?? path.join(extensionPath ?? path.dirname(__filename), '.storage');
+}
+
+/**
+ * Where failed-run diagnostics live: extension storage, never the workspace,
+ * so a run can never add files to the solution it tested.
+ */
+function diagnosticsRoot(): string {
+  return getCustomRunsettingsStorageDirectory();
+}
+
+function readDiagnosticsRetention(): DiagnosticsRetention {
+  const config = vscode.workspace.getConfiguration('dotnetTestingPlus');
+  return {
+    retainRuns: config.get<number>('diagnostics.retainRuns', DEFAULT_RETENTION.retainRuns),
+    retainTotalMb: config.get<number>('diagnostics.retainTotalMb', DEFAULT_RETENTION.retainTotalMb),
+    retainDays: config.get<number>('diagnostics.retainDays', DEFAULT_RETENTION.retainDays)
+  };
+}
+
+async function showRunDiagnostics(): Promise<void> {
+  const runs = runDiagnostics?.list() ?? [];
+  if (runs.length === 0) {
+    void vscode.window.showInformationMessage(
+      '.NET Testing+: no retained run diagnostics. Only runs that do not pass are retained; see dotnetTestingPlus.diagnostics.retainRuns.'
+    );
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    runs.map(run => ({
+      label: `${run.kind === 'build' ? 'Build' : 'Test run'} — ${path.basename(run.projectPath ?? run.solutionPath)}`,
+      description: `${run.status} · ${run.failureCount} failure(s) · ${formatBytes(run.totalBytes)} · ${run.finishedAt}`,
+      detail: run.directory,
+      run
+    })),
+    { title: 'Retained run diagnostics', placeHolder: 'Reveal a retained run in the file explorer' }
+  );
+  if (picked) {
+    await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(picked.run.directory));
+  }
+}
+
+function clearRunDiagnostics(): void {
+  const removed = runDiagnostics?.clear() ?? 0;
+  void vscode.window.showInformationMessage(
+    removed === 0 ? '.NET Testing+: no retained run diagnostics to delete.' : `.NET Testing+: deleted ${removed} retained run(s).`
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
 }
 
 async function setCustomRunsettingsValue(context: vscode.ExtensionContext, key: string, value: string, session = activeSession()): Promise<void> {

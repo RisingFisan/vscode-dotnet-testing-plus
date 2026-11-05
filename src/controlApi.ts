@@ -2,9 +2,11 @@ import * as crypto from 'crypto';
 import * as http from 'http';
 import * as vscode from 'vscode';
 import { log } from './logger';
+import { ArtifactPage, RunManifest, RunSummary } from './runDiagnostics';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_LOG_LINES = 200;
+const DEFAULT_RUN_ARTIFACT_BYTES = 64 * 1024;
 const SSE_HEARTBEAT_INTERVAL_MS = 20000;
 
 export class ControlApiError extends Error {
@@ -100,6 +102,11 @@ export interface ControlApiHandlers {
   setFilter(text: string): void;
   selectSolution(solutionId: string): Promise<boolean>;
   logLines(limit: number): string[];
+  /** Failed runs retained on disk, newest first. */
+  listRuns(): RunSummary[];
+  getRunManifest(runId: string): RunManifest | undefined;
+  /** Page of one retained artifact; undefined when the run or artifact is unknown. */
+  readRunArtifact(runId: string, name: string, offset: number, limit: number): ArtifactPage | undefined;
   getScreenshot(settings: unknown): unknown;
   getCode(solutionId: string, fqn: string): { fqn: string; file?: string; line?: number; code: string };
   getRunsettings(solutionId: string): Promise<unknown>;
@@ -241,6 +248,39 @@ async function routeLocalRequest(
 ): Promise<void> {
   const [first, second] = parsed.rest;
   const method = req.method;
+
+  // Retained run diagnostics: /runs, /runs/<runId>, /runs/<runId>/<artifact>.
+  if (first === 'runs') {
+    requireMethod(method, HttpMethod.Get, url.pathname);
+    if (parsed.rest.length === 1) {
+      sendJson(res, 200, { runs: handlers.listRuns() });
+      return;
+    }
+    if (parsed.rest.length === 2) {
+      const manifest = handlers.getRunManifest(decodeURIComponent(second));
+      if (!manifest) {
+        throw new ControlApiError(404, `Unknown retained run: ${second}`);
+      }
+      sendJson(res, 200, manifest);
+      return;
+    }
+    if (parsed.rest.length === 3) {
+      const name = decodeURIComponent(parsed.rest[2]);
+      const page = handlers.readRunArtifact(
+        decodeURIComponent(second),
+        name,
+        intQuery(url, 'offset', 0),
+        intQuery(url, 'limit', DEFAULT_RUN_ARTIFACT_BYTES)
+      );
+      if (!page) {
+        throw new ControlApiError(404, `Unknown artifact: ${name}`);
+      }
+      sendJson(res, 200, page);
+      return;
+    }
+    sendJson(res, 404, { error: 'Unknown endpoint' });
+    return;
+  }
 
   // Session-scoped routes (single segment).
   if (parsed.rest.length === 1) {
@@ -451,6 +491,15 @@ export function timingSafeEquals(a: string, b: string): boolean {
 function optionalQuery(url: URL, name: string): string | undefined {
   const value = url.searchParams.get(name);
   return value === null || value.length === 0 ? undefined : value;
+}
+
+function intQuery(url: URL, name: string, fallback: number): number {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.trim().length === 0) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function optionalString(value: unknown): string | undefined {

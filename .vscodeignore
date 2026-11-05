@@ -18,6 +18,9 @@ node_modules/web-tree-sitter/web-tree-sitter.wasm
 
 dummy-mes/**
 
+# Verification harness (dev-only; runs against compiled out/).
+harness/**
+
 # Knowledge bundle: documentation for agents/humans, not extension runtime data.
 knowledge/**
 okf-base.yaml

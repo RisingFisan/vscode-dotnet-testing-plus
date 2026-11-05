@@ -67,6 +67,24 @@
           "type": "object",
           "default": {},
           "description": "Permanent runsettings overrides applied on top of the base runsettings file."
+        },
+        "dotnetTestingPlus.diagnostics.retainRuns": {
+          "type": "number",
+          "default": 20,
+          "minimum": 0,
+          "description": "How many runs that do not pass (failures, errors, cancellations) keep their full diagnostics on disk. 0 disables retention entirely: stdout/stderr are then logged with an explicit per-chunk cap and nothing is kept after a run. Diagnostics live in extension storage, never in the workspace."
+        },
+        "dotnetTestingPlus.diagnostics.retainTotalMb": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "description": "Size budget, in MB, for retained run diagnostics. Older runs are pruned first; 0 means no size limit."
+        },
+        "dotnetTestingPlus.diagnostics.retainDays": {
+          "type": "number",
+          "default": 14,
+          "minimum": 0,
+          "description": "Retained run diagnostics older than this many days are pruned (the newest run is always kept); 0 means no age limit."
         }
       }
     },
@@ -160,6 +178,16 @@
         "category": ".NET Testing+"
       },
       {
+        "command": "dotnet-testing-plus.showRunDiagnostics",
+        "title": "Show Run Diagnostics...",
+        "category": ".NET Testing+"
+      },
+      {
+        "command": "dotnet-testing-plus.clearRunDiagnostics",
+        "title": "Delete Retained Run Diagnostics",
+        "category": ".NET Testing+"
+      },
+      {
         "command": "dotnet-testing-plus.goToCallSite",
         "title": "Go to Call Site in Test",
         "category": ".NET Testing+"
@@ -201,6 +229,11 @@
           "command": "dotnet-testing-plus.installAgentSkill",
           "when": "view == dotnet-testing-plus.view",
           "group": "1_overflow@2"
+        },
+        {
+          "command": "dotnet-testing-plus.showRunDiagnostics",
+          "when": "view == dotnet-testing-plus.view",
+          "group": "1_overflow@3"
         }
       ],
       "testing/item/context": [
@@ -221,6 +254,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
+    "harness": "node harness/diagnostics.js",
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {

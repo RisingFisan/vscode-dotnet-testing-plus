@@ -10,5 +10,5 @@
   "rules": {
     "@typescript-eslint/no-explicit-any": "off"
   },
-  "ignorePatterns": ["out", "node_modules"]
+  "ignorePatterns": ["out", "node_modules", "harness"]
 }
