@@ -199,6 +199,16 @@
         "category": ".NET Testing+"
       },
       {
+        "command": "dotnet-testing-plus.rerunFailed",
+        "title": "Rerun Failed",
+        "category": ".NET Testing+"
+      },
+      {
+        "command": "dotnet-testing-plus.debugFailed",
+        "title": "Debug Failed Tests",
+        "category": ".NET Testing+"
+      },
+      {
         "command": "dotnet-testing-plus.goToCallSite",
         "title": "Go to Call Site in Test",
         "category": ".NET Testing+"
@@ -254,14 +264,24 @@
       ],
       "testing/item/context": [
         {
-          "command": "dotnet-testing-plus.goToCallSite",
+          "command": "dotnet-testing-plus.rerunFailed",
           "when": "testItemHasFailures",
           "group": "navigation@1"
         },
         {
-          "command": "dotnet-testing-plus.goToErrorLocation",
+          "command": "dotnet-testing-plus.debugFailed",
           "when": "testItemHasFailures",
           "group": "navigation@2"
+        },
+        {
+          "command": "dotnet-testing-plus.goToCallSite",
+          "when": "testItemHasFailures",
+          "group": "navigation@3"
+        },
+        {
+          "command": "dotnet-testing-plus.goToErrorLocation",
+          "when": "testItemHasFailures",
+          "group": "navigation@4"
         }
       ]
     }

@@ -16,7 +16,7 @@ import { CodeLensHandle, registerCodeLenses } from './codeLens';
 import { coverageDetailsFor } from './coverage';
 import { SourceLocation } from './sourceScan';
 import { buildMethodIndex } from './astScan';
-import { buildSolutionPlaceholder, buildSolutionTree, testItemId, updateGroupLabels } from './testTree';
+import { buildSolutionPlaceholder, buildSolutionTree, solutionItemId, testItemId, updateGroupLabels } from './testTree';
 import { initLogger, showLog, log, recentLogLines } from './logger';
 import { DEFAULT_RETENTION, DiagnosticsRetention, RunDiagnosticsStore } from './runDiagnostics';
 import { ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiRunsettingsAction, ControlApiState, ControlApiSseEvent, ControlApiTest } from './controlApi';
@@ -226,6 +226,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dotnet-testing-plus.showOutput', () => showLog()),
     vscode.commands.registerCommand('dotnet-testing-plus.runAll', () => runAllTests(false)),
     vscode.commands.registerCommand('dotnet-testing-plus.debugAll', () => runAllTests(true)),
+    vscode.commands.registerCommand('dotnet-testing-plus.rerunFailed', (item?: vscode.TestItem | vscode.TestItem[]) =>
+      rerunFailed(item, false)),
+    vscode.commands.registerCommand('dotnet-testing-plus.debugFailed', (item?: vscode.TestItem | vscode.TestItem[]) =>
+      rerunFailed(item, true)),
     vscode.commands.registerCommand('dotnet-testing-plus.goToCallSite', async (item?: vscode.TestItem) => {
       await navigateToFailureLocation(item, 'callSite');
     }),
@@ -1217,6 +1221,67 @@ async function runAllTests(debug: boolean): Promise<void> {
   } finally {
     cts.dispose();
   }
+}
+
+/**
+ * "Rerun Failed" on a solution/project/class node: starts a run containing
+ * only the leaf tests under that node whose last known result is `failed`.
+ * The context menu passes one TestItem for a single selection and an array
+ * for a multi-selection; the failed leaves of all selected nodes run together.
+ */
+async function rerunFailed(itemOrItems: vscode.TestItem | vscode.TestItem[] | undefined, debug: boolean): Promise<void> {
+  const items = Array.isArray(itemOrItems) ? itemOrItems : itemOrItems ? [itemOrItems] : [];
+  if (items.length === 0) {
+    return;
+  }
+  const descriptors = collectDescriptors();
+  const failed = new Map<string, vscode.TestItem>();
+  items.forEach(item => {
+    const session = sessionForTreeItem(item);
+    if (session) {
+      failedLeavesOf(item, session, descriptors).forEach(leaf => failed.set(leaf.id, leaf));
+    }
+  });
+  if (failed.size === 0) {
+    vscode.window.showInformationMessage('No failed tests to rerun under that selection.');
+    return;
+  }
+  const cts = new vscode.CancellationTokenSource();
+  try {
+    await runWithSolutions(new vscode.TestRunRequest([...failed.values()]), cts.token, debug, descriptors);
+  } finally {
+    cts.dispose();
+  }
+}
+
+/** The loaded session whose tree contains `item` (node ids are solution-qualified). */
+function sessionForTreeItem(item: vscode.TestItem): SolutionSession | undefined {
+  return [...sessions.values()].find(session => {
+    const solutionId = solutionItemId(session.solutionPath);
+    const testPrefix = `test:${encodeURIComponent(session.solutionPath)}:`;
+    return item.id === solutionId || item.id.startsWith(`${solutionId}:`) || item.id.startsWith(testPrefix);
+  });
+}
+
+/** Leaf tests under `item` whose last known result is `failed`. */
+function failedLeavesOf(
+  item: vscode.TestItem,
+  session: SolutionSession,
+  descriptors: ReadonlyMap<string, TestDescriptor>
+): vscode.TestItem[] {
+  const failed: vscode.TestItem[] = [];
+  const walk = (node: vscode.TestItem): void => {
+    if (node.children.size > 0) {
+      childrenOf(node).forEach(walk);
+      return;
+    }
+    const fqn = descriptors.get(node.id)?.fullyQualifiedName;
+    if (fqn && session.testResultStates.get(fqn) === 'failed') {
+      failed.push(node);
+    }
+  };
+  walk(item);
+  return failed;
 }
 
 async function runTestFromCodeLens(sessionKey: string | undefined, fqn: string | undefined, debug: boolean): Promise<void> {
