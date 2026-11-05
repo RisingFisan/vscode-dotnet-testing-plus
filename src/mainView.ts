@@ -5,6 +5,9 @@ import { ApiRuntimeState } from './apiCoordinator';
 import { TestResultFilter, TestResultFilterKey, createDefaultTestResultFilter } from './testResultFilter';
 import { ScreenshotOptions, ScreenshotSnapshot } from './screenshot';
 
+/** Which solutions the panel's filters and export actions apply to. */
+export type SolutionScope = 'selected' | 'all';
+
 export interface SolutionTabState {
   key: string;
   label: string;
@@ -27,7 +30,9 @@ export interface MainViewState {
   hasExplicitRunsettings: boolean;
   filter: string;
   visibleTestCount?: number;
-  searchAllSolutions: boolean;
+  /** Visible tests across every solution, used by the "All Solutions" scope. */
+  visibleTestCountAll: number;
+  solutionScope: SolutionScope;
   resultFilter: TestResultFilter;
   skipPreBreakpoint: boolean;
   notFoundTests: string[];
@@ -47,7 +52,7 @@ export type MainViewAction =
   | { type: 'removeSolution'; key?: string }
   | { type: 'selectSession'; key: string }
   | { type: 'filter'; text: string }
-  | { type: 'toggleSearchAllSolutions'; checked: boolean }
+  | { type: 'setSolutionScope'; scope: SolutionScope }
   | { type: 'clearFilter' }
   | { type: 'setResultFilter'; key: TestResultFilterKey; checked: boolean }
   | { type: 'toggleSkipPreBreakpoint'; checked: boolean }
@@ -96,6 +101,7 @@ interface WebviewMessage {
   isPermanent?: boolean;
   field?: 'name' | 'value';
   resultFilterKey?: TestResultFilterKey;
+  scope?: SolutionScope;
   settings?: ScreenshotExportSettings;
   data?: string;
   savePath?: string;
@@ -112,7 +118,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
     defaultRunsettingsAvailable: false,
     hasExplicitRunsettings: false,
     filter: '',
-    searchAllSolutions: false,
+    visibleTestCountAll: 0,
+    solutionScope: 'selected',
     resultFilter: createDefaultTestResultFilter(),
     skipPreBreakpoint: true,
     notFoundTests: [],
@@ -196,8 +203,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       this.onAction({ type: 'toggleSkipPreBreakpoint', checked: msg.checked ?? true });
     } else if (msg.type === 'toggleControlApi') {
       this.onAction({ type: 'toggleControlApi', checked: !!msg.checked });
-    } else if (msg.type === 'toggleSearchAllSolutions') {
-      this.onAction({ type: 'toggleSearchAllSolutions', checked: !!msg.checked });
+    } else if (msg.type === 'setSolutionScope' && (msg.scope === 'selected' || msg.scope === 'all')) {
+      this.onAction({ type: 'setSolutionScope', scope: msg.scope });
     } else if (msg.type === 'setCustomRunsettingsValue' && msg.key !== undefined) {
       this.onAction({ type: 'setCustomRunsettingsValue', key: msg.key, value: msg.value ?? '' });
     } else if (msg.type === 'resetCustomRunsettingsValue' && msg.key !== undefined) {
@@ -242,7 +249,8 @@ export class MainViewProvider implements vscode.WebviewViewProvider {
       hasExplicitRunsettings: s.hasExplicitRunsettings,
       filter: s.filter,
       visibleTestCount: s.visibleTestCount,
-      searchAllSolutions: s.searchAllSolutions,
+      visibleTestCountAll: s.visibleTestCountAll,
+      solutionScope: s.solutionScope,
       resultFilter: s.resultFilter,
       skipPreBreakpoint: s.skipPreBreakpoint,
       controlApiEnabled: s.controlApiEnabled,
@@ -277,7 +285,20 @@ function renderHtml(screenshotOnly = false): string {
     color: var(--vscode-foreground);
   }
   #mainContent { display: flex; flex-direction: column; gap: 8px; }
-  .advanced-search-header { display: flex; align-items: center; justify-content: space-between; position: relative; }
+  .advanced-tools-header { display: flex; align-items: center; justify-content: space-between; position: relative; }
+  .tools-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 0;
+    border: 1px solid var(--vscode-surface-border, var(--vscode-widget-border));
+    border-radius: 8px;
+    background: var(--vscode-panel-background);
+  }
+  .tools-divider { border-top: 1px solid var(--vscode-surface-border, var(--vscode-widget-border)); }
+  .solution-scope { gap: 6px; }
+  .solution-scope .scope-label { opacity: 0.65; cursor: pointer; }
+  .solution-scope .scope-label.active { opacity: 1; font-weight: 600; }
   .help-button {
     display: inline-flex;
     align-items: center;
@@ -492,9 +513,9 @@ function renderHtml(screenshotOnly = false): string {
 </head>
 <body class="${screenshotOnly ? 'screenshot-only' : ''}">
   <div id="mainContent">
-  <div class="section advanced-search-header">
-    <span class="label">Advanced Search</span>
-    <button class="help-button" id="searchHelpButton" type="button" title="Advanced Search syntax help" aria-label="Advanced Search syntax help" aria-expanded="false">?</button>
+  <div class="section advanced-tools-header">
+    <span class="label">Advanced Tools</span>
+    <button class="help-button" id="searchHelpButton" type="button" title="Advanced Tools filter syntax help" aria-label="Advanced Tools filter syntax help" aria-expanded="false">?</button>
     <div class="help-popup" id="searchHelpPopup" hidden>
       <div class="help-popup-title">Filters:</div>
       <ul class="help-popup-list">
@@ -520,7 +541,8 @@ function renderHtml(screenshotOnly = false): string {
       </div>
     </div>
   </div>
-  <div class="filter-row">
+  <div class="tools-wrapper">
+  <div class="section filter-row">
       <input id="filter" type="text"
         placeholder="Filter: class:Checkout & (project=Web|class:Cart)"/>
       <button class="icon-button" id="clearFilter" title="Clear" aria-label="Clear"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m8 7.293 4.646-4.647.708.708L8.707 8l4.647 4.646-.708.708L8 8.707l-4.646 4.647-.708-.708L7.293 8 2.646 3.354l.708-.708z"/></svg></button>
@@ -534,16 +556,22 @@ function renderHtml(screenshotOnly = false): string {
        </div>
       </div>
     </div>
-    <div class="section row search-all-solutions-row" id="searchAllSolutionsRow" hidden>
-      <label class="toggle search-all-solutions" title="Apply the Advanced Search filter to every loaded solution instead of only the selected one.">
-        <input type="checkbox" id="searchAllSolutions"/>
-        <span class="label">Search in All Solutions</span>
-      </label>
-    </div>
     <div class="section export-actions">
-     <button id="saveAsPlaylist" title="Export the tests currently visible in the Test Explorer to a .playlist file" disabled>Save As Playlist</button>
+     <button id="saveAsPlaylist" title="Export the currently visible tests to a .playlist file, for the scope selected below" disabled>Save As Playlist</button>
      <button id="exportScreenshot" title="Export an image of the visible test results">Export Screenshot</button>
    </div>
+    <div class="tools-divider"></div>
+    <div class="section row solution-scope-row" id="solutionScopeRow" hidden>
+      <div class="switch-toggle solution-scope" role="group" aria-label="Solution scope">
+        <span class="scope-label" id="solutionScopeSelected" title="Apply the filters and exports to the selected solution only.">Selected Solution</span>
+        <label class="scope-switch" title="Apply the filters and exports to every loaded solution instead of only the selected one.">
+          <input type="checkbox" id="solutionScopeAll"/>
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+        <span class="scope-label" id="solutionScopeAllLabel" title="Apply the filters and exports to every loaded solution instead of only the selected one.">All Solutions</span>
+      </div>
+    </div>
+  </div>
   <div class="divider" style="border-top: 1px solid var(--vscode-surface-border);"></div>
   <div class="section">
     <span class="label">Solution Manager</span>
@@ -677,7 +705,8 @@ function renderHtml(screenshotOnly = false): string {
   }
 
   function updateSaveAsPlaylist() {
-    $('saveAsPlaylist').disabled = latestVisibleTestCount === 0;
+    const visible = latestSolutionScope === 'all' ? latestVisibleTestCountAll : latestVisibleTestCount;
+    $('saveAsPlaylist').disabled = visible === 0;
   }
 
   let debounce;
@@ -778,6 +807,10 @@ function renderHtml(screenshotOnly = false): string {
     });
     let latestSessions = [];
     let latestVisibleTestCount = 0;
+    let latestVisibleTestCountAll = 0;
+    let latestSolutionScope = 'selected';
+    let latestActiveSessionKey;
+    let previousSolutionScope;
     let screenshotPreviewUrl;
     let screenshotPng;
     let screenshotPreviewRequest = 0;
@@ -819,7 +852,7 @@ function renderHtml(screenshotOnly = false): string {
         const input = document.createElement('input');
         input.type = 'checkbox';
         input.dataset.solutionKey = session.key;
-        input.checked = !!session.ready;
+        input.checked = !!session.ready && (latestSolutionScope === 'all' || session.key === latestActiveSessionKey);
         input.disabled = !session.ready;
         input.title = session.ready ? session.detail : 'Tests are still loading for this solution.';
         input.addEventListener('change', scheduleScreenshotPreview);
@@ -1157,8 +1190,23 @@ function renderHtml(screenshotOnly = false): string {
     vscode.postMessage({ type: 'toggleSkipPreBreakpoint', checked: e.target.checked }));
   $('controlApiEnabled').addEventListener('change', e =>
     vscode.postMessage({ type: 'toggleControlApi', checked: e.target.checked }));
-  $('searchAllSolutions').addEventListener('change', e =>
-    vscode.postMessage({ type: 'toggleSearchAllSolutions', checked: e.target.checked }));
+  const solutionScopeAll = $('solutionScopeAll');
+  function applySolutionScope(scope) {
+    const changed = latestSolutionScope !== scope;
+    latestSolutionScope = scope;
+    solutionScopeAll.checked = scope === 'all';
+    $('solutionScopeSelected').classList.toggle('active', scope !== 'all');
+    $('solutionScopeAllLabel').classList.toggle('active', scope === 'all');
+    updateSaveAsPlaylist();
+    if (changed) {
+      vscode.postMessage({ type: 'setSolutionScope', scope });
+    }
+  }
+  solutionScopeAll.addEventListener('change', () => applySolutionScope(solutionScopeAll.checked ? 'all' : 'selected'));
+  // Each side label selects its own side: a single wrapping label would toggle
+  // the switch instead, so clicking the already-active side would flip it.
+  $('solutionScopeSelected').addEventListener('click', () => applySolutionScope('selected'));
+  $('solutionScopeAllLabel').addEventListener('click', () => applySolutionScope('all'));
 
   const customDebounces = {};
   const pendingCustomValues = Object.create(null);
@@ -1453,6 +1501,9 @@ function renderHtml(screenshotOnly = false): string {
     previousActiveSessionKey = s.activeSessionKey;
     latestSessions = s.sessions || [];
     latestVisibleTestCount = s.visibleTestCount ?? 0;
+    latestVisibleTestCountAll = s.visibleTestCountAll ?? 0;
+    latestActiveSessionKey = s.activeSessionKey;
+    latestSolutionScope = s.solutionScope === 'all' ? 'all' : 'selected';
     renderSessions(s.sessions, s.activeSessionKey);
     if (sessionSwitched) {
       userEditedFilter = false;
@@ -1507,13 +1558,25 @@ function renderHtml(screenshotOnly = false): string {
       $('controlApiStatusRow').hidden = true;
     }
     const multiSolutions = (s.sessions || []).length > 1;
-    $('searchAllSolutionsRow').hidden = !multiSolutions;
-    $('searchAllSolutions').checked = !!s.searchAllSolutions;
+    $('solutionScopeRow').hidden = !multiSolutions;
+    $('solutionScopeAll').checked = latestSolutionScope === 'all';
+    $('solutionScopeSelected').classList.toggle('active', latestSolutionScope !== 'all');
+    $('solutionScopeAllLabel').classList.toggle('active', latestSolutionScope === 'all');
     $('exportScreenshot').disabled = !latestSessions.some(session => session.ready) || !!s.screenshotEmpty;
       if (screenshotOnly && !screenshotPanelInitialized) {
        screenshotPanelInitialized = true;
        openScreenshotModal();
      }
+    // The scope only pre-selects the screenshot menu; the ticks stay
+    // authoritative for the export. The sidebar has no screenshot menu, so
+    // this only ever runs in the screenshot panel.
+    const scopeChanged = previousSolutionScope !== undefined && previousSolutionScope !== latestSolutionScope;
+    previousSolutionScope = latestSolutionScope;
+    if (scopeChanged && screenshotOnly && $('screenshotModal') && !$('screenshotModal').hidden) {
+      renderScreenshotSolutions();
+      // Ticking a checkbox programmatically fires no change event.
+      scheduleScreenshotPreview();
+    }
     setNotFoundTests(s.notFoundTests);
     renderCustomRunsettings(s.customRunsettings);
   });

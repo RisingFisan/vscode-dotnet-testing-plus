@@ -22,7 +22,7 @@ import { DEFAULT_RETENTION, DiagnosticsRetention, RunDiagnosticsStore } from './
 import { ControlApiError, ControlApiHandlers, ControlApiRunOptions, ControlApiRunResult, ControlApiRunsettingsAction, ControlApiState, ControlApiSseEvent, ControlApiTest } from './controlApi';
 import { ApiCoordinator } from './apiCoordinator';
 import { assignUniqueId, deriveSessionBaseId, solutionIdFromPath } from './apiIds';
-import { MainViewProvider, MainViewAction, ScreenshotExportSettings } from './mainView';
+import { MainViewProvider, MainViewAction, ScreenshotExportSettings, SolutionScope } from './mainView';
 import { TestFilter, parseTestFilter, filterEntries } from './testFilter';
 import { TestResultFilter, TestResultFilterKey, TestResultState, createDefaultTestResultFilter, isTestResultVisible } from './testResultFilter';
 import { buildScreenshotSnapshot, ScreenshotOptions, ScreenshotSessionData, ScreenshotSnapshot } from './screenshot';
@@ -124,7 +124,7 @@ let extensionContext: vscode.ExtensionContext | undefined;
 let mainView: MainViewProvider;
 const sessions = new Map<string, SolutionSession>();
 let activeSessionKey: string | undefined;
-let searchAllSolutions = false;
+let solutionScope: SolutionScope = 'selected';
 // Every in-flight run (UI, CodeLens or API); Cancel and deactivate stop them all.
 const activeRuns = new Set<vscode.CancellationTokenSource>();
 // Solutions with a run in flight: a second run on the same solution is refused.
@@ -572,10 +572,18 @@ async function addSolution(context: vscode.ExtensionContext): Promise<void> {
   }
   const session = createSession({ solutionPath: key });
   const currentFilter = activeSession()?.activeFilter;
+  const currentResultFilter = activeSession()?.testResultFilter;
   sessions.set(session.key, session);
   activeSessionKey = session.key;
-  if (searchAllSolutions && currentFilter) {
-    session.activeFilter = currentFilter;
+  if (solutionScope === 'all') {
+    if (currentFilter) {
+      session.activeFilter = currentFilter;
+    }
+    if (currentResultFilter) {
+      // Clone: filters are mutated in place, so a shared object would leak
+      // edits made later in 'selected' scope into this session.
+      session.testResultFilter = { ...currentResultFilter };
+    }
   }
   watchRunsettingsFile(session);
   await saveSessions(context);
@@ -593,7 +601,7 @@ async function removeSolution(context: vscode.ExtensionContext, key?: string): P
   runsettingsViewCache.delete(session.key);
   sessions.delete(session.key);
   if (sessions.size <= 1) {
-    searchAllSolutions = false;
+    solutionScope = 'selected';
   }
   if (activeSessionKey === session.key) {
     activeSessionKey = sessions.keys().next().value;
@@ -609,7 +617,7 @@ async function selectSession(context: vscode.ExtensionContext, key: string): Pro
   }
   const previousSession = activeSession();
   activeSessionKey = key;
-  if (searchAllSolutions && previousSession?.activeFilter) {
+  if (solutionScope === 'all' && previousSession?.activeFilter) {
     const current = activeSession();
     if (current && !current.activeFilter) {
       current.activeFilter = previousSession.activeFilter;
@@ -1628,7 +1636,7 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
     case 'clearRunsettings': await clearRunsettings(context); break;
     case 'openRunsettings': await openActiveRunsettings(); break;
     case 'filter': applyFilterInput(action.text); break;
-    case 'toggleSearchAllSolutions': toggleSearchAllSolutions(action.checked); break;
+    case 'setSolutionScope': setSolutionScope(action.scope); break;
     case 'clearFilter': clearSearchFilters(); break;
     case 'setResultFilter': applyResultFilter(action.key, action.checked); break;
     case 'toggleSkipPreBreakpoint':
@@ -1656,7 +1664,7 @@ async function handleViewAction(context: vscode.ExtensionContext, action: MainVi
 
 function applyFilterInput(text: string): void {
   const filter = parseTestFilter(text);
-  if (searchAllSolutions) {
+  if (solutionScope === 'all') {
     for (const s of sessions.values()) {
       s.activeFilter = filter;
       s.treeDirty = true;
@@ -1673,16 +1681,25 @@ function applyFilterInput(text: string): void {
   void updateContexts();
 }
 
-function toggleSearchAllSolutions(checked: boolean): void {
-  if (searchAllSolutions === checked) {
+function setSolutionScope(scope: SolutionScope): void {
+  if (solutionScope === scope) {
     return;
   }
-  searchAllSolutions = checked;
+  solutionScope = scope;
   const currentFilter = activeSession()?.activeFilter;
+  const currentResultFilter = activeSession()?.testResultFilter;
   for (const s of sessions.values()) {
-    if (searchAllSolutions) {
+    if (solutionScope === 'all') {
       s.activeFilter = currentFilter;
+      if (currentResultFilter) {
+        // Clone per session: filters are mutated in place, and the entries
+        // cache keys on resultFilterVersion, not on object identity.
+        s.testResultFilter = { ...currentResultFilter };
+        s.resultFilterVersion++;
+      }
     } else if (s.key !== activeSessionKey) {
+      // The text filter has a natural "off" state; the result filter's default
+      // is an affirmative choice, so leaving 'all' keeps the sessions' own.
       s.activeFilter = undefined;
     }
     s.treeDirty = true;
@@ -1694,7 +1711,7 @@ function toggleSearchAllSolutions(checked: boolean): void {
 function clearSearchFilters(): void {
   // Mirrors applyFilterInput's scoping: the text filter follows the search
   // mode, and the result filter is cleared for every session it can gate.
-  if (searchAllSolutions) {
+  if (solutionScope === 'all') {
     for (const s of sessions.values()) {
       s.activeFilter = undefined;
       s.testResultFilter = createDefaultTestResultFilter();
@@ -1716,13 +1733,21 @@ function clearSearchFilters(): void {
 }
 
 function applyResultFilter(key: TestResultFilterKey, checked: boolean): void {
-  const session = activeSession();
-  if (!session || session.testResultFilter[key] === checked) {
+  const active = activeSession();
+  const targets = solutionScope === 'all' ? [...sessions.values()] : active ? [active] : [];
+  let changed = false;
+  for (const session of targets) {
+    if (session.testResultFilter[key] === checked) {
+      continue;
+    }
+    session.testResultFilter[key] = checked;
+    session.resultFilterVersion++;
+    session.treeDirty = true;
+    changed = true;
+  }
+  if (!changed) {
     return;
   }
-  session.testResultFilter[key] = checked;
-  session.resultFilterVersion++;
-  session.treeDirty = true;
   renderTree();
   void updateContexts();
 }
@@ -1869,17 +1894,23 @@ async function refreshSolution(session: SolutionSession | undefined): Promise<vo
 }
 
 async function savePlaylistAs(): Promise<void> {
-  const session = activeSession();
-  if (!session?.knownTests) {
+  const active = activeSession();
+  if (!active) {
     return;
   }
-  const fqns = entriesForSession(session).map(entry => entry.fullyQualifiedName);
+  const scoped = solutionScope === 'all' ? [...sessions.values()] : [active];
+  if (!scoped.some(session => session.knownTests !== undefined)) {
+    return;
+  }
+  // FQNs repeat across solutions only by coincidence; a playlist entry must
+  // appear once.
+  const fqns = [...new Set(scoped.flatMap(session => entriesForSession(session).map(entry => entry.fullyQualifiedName)))];
   if (fqns.length === 0) {
     vscode.window.showInformationMessage('No tests are currently visible to export.');
     return;
   }
   const uri = await vscode.window.showSaveDialog({
-    defaultUri: vscode.Uri.file(path.join(path.dirname(session.solutionPath), `${path.basename(session.solutionPath, path.extname(session.solutionPath))}.playlist`)),
+    defaultUri: vscode.Uri.file(path.join(path.dirname(active.solutionPath), `${path.basename(active.solutionPath, path.extname(active.solutionPath))}.playlist`)),
     filters: { 'Visual Studio Test Playlist': ['playlist'] }, title: 'Save As Playlist'
   });
   if (!uri) {
@@ -2582,7 +2613,8 @@ async function updateViewState(): Promise<void> {
     hasExplicitRunsettings: session?.runsettingsPath !== undefined,
     filter: session?.activeFilter?.raw ?? '',
     visibleTestCount: session ? entriesForSession(session).length : undefined,
-    searchAllSolutions,
+    visibleTestCountAll: [...sessions.values()].reduce((total, item) => total + entriesForSession(item).length, 0),
+    solutionScope,
     resultFilter: session?.testResultFilter ?? createDefaultTestResultFilter(),
     notFoundTests: session?.notFoundTests ?? [],
     customRunsettings: customView,
