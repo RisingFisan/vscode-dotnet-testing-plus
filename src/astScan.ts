@@ -4,7 +4,7 @@ import { Parser, Language, Node } from 'web-tree-sitter';
 import { log } from './logger';
 import { SourceLocation, extractMethodsRegex, walkCsFilesAsync } from './sourceScan';
 import { TEST_ATTRIBUTES, mayContainTests } from './testAttributes';
-import { ExtractedMethod, FileScanCache, foldMethods } from './fileScanCache';
+import { ExtractedMethod, FileScanCache, contentHash, foldMethods } from './fileScanCache';
 
 interface MethodIndexData {
   methodIndex: Map<string, Set<string>>;
@@ -47,8 +47,16 @@ const REGEX_VERSION = 'regex-1';
 // Files are stat'ed/read concurrently in groups of this size, then folded in
 // the original order (the first-wins fold contract depends on it).
 const SCAN_CHUNK = 64;
+// One `parser.parse` call is synchronous, so a file is the finest granularity
+// at which the scan can hand the event loop back. A group of large files used
+// to freeze the extension host for seconds; this bounds that to the budget.
+const YIELD_BUDGET_MS = 8;
 const MAX_LOGGED_AST_FAILURES = 3;
 let loggedAstFailures = 0;
+
+function yieldToHost(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
 
 /**
  * Identity of the WASM assets (mtime+size of both files), or undefined when
@@ -78,6 +86,8 @@ interface LoadedFile {
   methods?: ExtractedMethod[];
   /** File content, only read on a cache miss. */
   content?: string;
+  /** Content digest, computed when the file had to be read. */
+  hash?: string;
 }
 
 export async function buildMethodIndex(
@@ -109,6 +119,7 @@ export async function buildMethodIndex(
   // Directories already listed by an earlier project root; nested or
   // overlapping project directories would otherwise re-walk entire subtrees.
   const visitedDirs = new Set<string>();
+  let lastYield = Date.now();
 
   const loadFile = async (file: string): Promise<LoadedFile | undefined> => {
     let stat: fs.Stats;
@@ -122,7 +133,8 @@ export async function buildMethodIndex(
       return { file, stat, methods: cached };
     }
     try {
-      return { file, stat, content: await fs.promises.readFile(file, 'utf8') };
+      const content = await fs.promises.readFile(file, 'utf8');
+      return { file, stat, content, hash: contentHash(content) };
     } catch {
       return undefined;
     }
@@ -148,6 +160,14 @@ export async function buildMethodIndex(
           continue;
         }
         let methods = item.methods;
+        if (!methods && item.hash !== undefined) {
+          // Same bytes seen at another path (another worktree, branch or copy):
+          // reuse the extraction instead of parsing again.
+          methods = scanned.getByContent(item.hash, hitVersion);
+          if (methods) {
+            scanned.reuse(item.file, item.stat.mtimeMs, item.stat.size, item.hash);
+          }
+        }
         if (!methods) {
           if (parser === undefined) {
             parser = await ensureParser(extensionPath);
@@ -159,10 +179,21 @@ export async function buildMethodIndex(
           }
           const missVersion = parser ? AST_VERSION : REGEX_VERSION;
           methods = extractFile(parser, item.content ?? '', item.file);
-          scanned.set(item.file, item.stat.mtimeMs, item.stat.size, missVersion, methods);
+          scanned.set(
+            item.file,
+            item.stat.mtimeMs,
+            item.stat.size,
+            item.hash ?? contentHash(item.content ?? ''),
+            missVersion,
+            methods
+          );
           lastMissVersion = missVersion;
         }
         foldMethods(methods, item.file, csprojPath, methodIndex, locations, projects);
+        if (Date.now() - lastYield >= YIELD_BUDGET_MS) {
+          await yieldToHost();
+          lastYield = Date.now();
+        }
       }
     }
   }

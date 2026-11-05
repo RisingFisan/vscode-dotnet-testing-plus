@@ -77,15 +77,32 @@ export function fingerprintFqns(fqns: Iterable<string>): string {
   return crypto.createHash('sha1').update(sorted.join('\n')).digest('hex');
 }
 
-interface StorageEntry {
+interface FileRecord {
   /** mtime in ms */
   m: number;
   /** file size in bytes */
   s: number;
+  /** content digest — the key into `content` */
+  h: string;
+}
+
+interface ContentRecord {
   /** scanner version that produced the extraction */
   v: string;
   /** compact [bare, fqn, line] tuples for each test method */
   t: [string, string, number][];
+}
+
+/** Bumped when the persisted shape changes; a mismatch starts an empty store. */
+const STORE_SCHEMA = 2;
+
+/**
+ * Content identity of one file. Extraction depends on nothing but the text and
+ * the scanner version, so identical content anywhere (another worktree, another
+ * branch, another checkout of the same repo) can reuse the same extraction.
+ */
+export function contentHash(content: string): string {
+  return crypto.createHash('sha1').update(content).digest('hex');
 }
 
 /**
@@ -106,23 +123,28 @@ function sameMethods(before: [string, string, number][] | undefined, after: [str
 }
 
 /**
- * Scan cache keyed by absolute file path. An entry is valid as long as the
- * file's mtime and size are unchanged and the scanner version matches;
- * extraction logic changes must bump the version so every entry invalidates
- * exactly once (mirrors SolutionCache's parserVersion contract).
+ * Scan cache keyed by absolute file path, with extraction results stored by
+ * content hash rather than by path.
+ *
+ * Two lookups, cheapest first: a path whose mtime+size are unchanged is served
+ * without reading the file; a path whose stat changed is hashed after reading
+ * and, if that content was seen before, reuses the extraction without parsing.
+ * That second tier is what makes a different worktree or branch checkout of the
+ * same sources warm instead of a full re-parse.
  *
  * Persisted to `<storageDir>/scan-cache.json` (whole-map write, best-effort —
  * like SolutionCache) when dirty. `storageDir === undefined` keeps the store
  * memory-only, which is what harnesses use.
  */
 export class FileScanCache {
-  private data: Record<string, StorageEntry> = {};
+  private files: Record<string, FileRecord> = {};
+  private content: Record<string, ContentRecord> = {};
   private readonly file: string | undefined;
   private readonly engineFile: string | undefined;
-  // Materialized views of each entry's tuples, keyed by entry object — a
-  // WeakMap (rather than a field on the entry) keeps the persisted JSON free
-  // of the duplicate form.
-  private readonly materialized = new WeakMap<StorageEntry, ExtractedMethod[]>();
+  // Materialized views of each content record's tuples, keyed by record object
+  // — a WeakMap (rather than a field) keeps the persisted JSON free of the
+  // duplicate form.
+  private readonly materialized = new WeakMap<ContentRecord, ExtractedMethod[]>();
   private dirty = false;
 
   constructor(storageDir: string | undefined) {
@@ -131,67 +153,87 @@ export class FileScanCache {
     if (this.file) {
       try {
         const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          this.data = parsed;
+        if (parsed && typeof parsed === 'object' && parsed.schema === STORE_SCHEMA) {
+          this.files = parsed.files ?? {};
+          this.content = parsed.content ?? {};
         }
       } catch {
-        // Missing or corrupt cache: start fresh, same as SolutionCache.
+        // Missing, corrupt or older-schema cache: start fresh, same as SolutionCache.
       }
     }
   }
 
+  /** Path-keyed lookup: valid while mtime+size are unchanged. */
   get(file: string, mtimeMs: number, size: number, version: string): ExtractedMethod[] | undefined {
-    const entry = this.data[file];
-    if (!entry || entry.m !== mtimeMs || entry.s !== size || entry.v !== version || !Array.isArray(entry.t)) {
+    const record = this.files[file];
+    if (!record || record.m !== mtimeMs || record.s !== size) {
       return undefined;
     }
-    // Materialize once per entry — a fully-cached reload hits this for
-    // every unchanged file — and share the result; callers must treat it
-    // as read-only.
-    const cached = this.materialized.get(entry);
+    return this.getByContent(record.h, version);
+  }
+
+  /** Content-keyed lookup: what a file's bytes extracted to, if seen before. */
+  getByContent(hash: string, version: string): ExtractedMethod[] | undefined {
+    const record = this.content[hash];
+    if (!record || record.v !== version || !Array.isArray(record.t)) {
+      return undefined;
+    }
+    // Materialize once per record — a fully-cached reload hits this for every
+    // unchanged file — and share the result; callers must treat it as read-only.
+    const cached = this.materialized.get(record);
     if (cached) {
       return cached;
     }
-    const methods = entry.t.map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
-    this.materialized.set(entry, methods);
+    const methods = record.t.map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
+    this.materialized.set(record, methods);
     return methods;
   }
 
-  set(file: string, mtimeMs: number, size: number, version: string, methods: readonly ExtractedMethod[]): void {
-    const stored: StorageEntry = {
-      m: mtimeMs,
-      s: size,
-      v: version,
-      t: methods.map(method => [method.bare, method.fullyQualifiedName, method.line])
-    };
-    const before = this.data[file];
-    // The common case for known files is an identical extraction, so only
-    // genuinely changed entries mark the store for persistence.
-    if (
-      !before ||
-      before.m !== stored.m ||
-      before.s !== stored.s ||
-      before.v !== stored.v ||
-      !sameMethods(before.t, stored.t)
-    ) {
-      this.data[file] = stored;
+  /** Record a path→content association without re-extracting (known content). */
+  reuse(file: string, mtimeMs: number, size: number, hash: string): void {
+    const before = this.files[file];
+    if (!before || before.m !== mtimeMs || before.s !== size || before.h !== hash) {
+      this.files[file] = { m: mtimeMs, s: size, h: hash };
+      this.dirty = true;
+    }
+  }
+
+  set(file: string, mtimeMs: number, size: number, hash: string, version: string, methods: readonly ExtractedMethod[]): void {
+    this.reuse(file, mtimeMs, size, hash);
+    const tuples = methods.map(method => [method.bare, method.fullyQualifiedName, method.line] as [string, string, number]);
+    const before = this.content[hash];
+    // The common case for known content is an identical extraction, so only
+    // genuinely changed records mark the store for persistence.
+    if (!before || before.v !== version || !sameMethods(before.t, tuples)) {
+      this.content[hash] = { v: version, t: tuples };
       this.dirty = true;
     }
   }
 
   /**
-   * Drop entries for files that no longer exist. Only entries under one of
-   * `roots` (directories whose listing succeeded this scan) are candidates, so
-   * scanning one solution never evicts another solution's entries.
+   * Drop entries for files that no longer exist, then garbage-collect content
+   * records nothing refers to any more. Only entries under one of `roots`
+   * (directories whose listing succeeded this scan) are candidates, so scanning
+   * one solution never evicts another solution's entries.
    */
   prune(seenFiles: ReadonlySet<string>, roots: readonly string[]): void {
     if (roots.length === 0) {
       return;
     }
     const prefixes = roots.map(root => (root.endsWith(path.sep) ? root : root + path.sep));
-    for (const key of Object.keys(this.data)) {
+    for (const key of Object.keys(this.files)) {
       if (!seenFiles.has(key) && prefixes.some(prefix => key.startsWith(prefix))) {
-        delete this.data[key];
+        delete this.files[key];
+        this.dirty = true;
+      }
+    }
+    const reachable = new Set<string>();
+    for (const record of Object.values(this.files)) {
+      reachable.add(record.h);
+    }
+    for (const hash of Object.keys(this.content)) {
+      if (!reachable.has(hash)) {
+        delete this.content[hash];
         this.dirty = true;
       }
     }
@@ -230,7 +272,7 @@ export class FileScanCache {
       return;
     }
     try {
-      writeFileAtomic(this.file, JSON.stringify(this.data));
+      writeFileAtomic(this.file, JSON.stringify({ schema: STORE_SCHEMA, files: this.files, content: this.content }));
       this.dirty = false;
     } catch {
       // Persistence is best-effort.
