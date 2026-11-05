@@ -15,6 +15,7 @@ You can use .NET Testing+ alongside the official C# Dev Kit extension, but they 
 - Use custom runsettings files.
 - Run Test / Debug Test CodeLens links above test methods in the editor.
 - Collect code coverage (XPlat Code Coverage) via the "Run with Coverage" profile in the Test Explorer.
+- Keep the complete stdout/stderr, TRX and streamed results of failing runs as retrievable diagnostics (bounded by count, size and age).
 - Load `.sln`, `.slnf` (solution filter), and `.slnx` solutions.
 
 ## Getting Started
@@ -33,8 +34,10 @@ The extension includes a ".NET Testing+" view.
 
 This view includes the following options:
 
-- **Advanced Search**: allows you to filter tests by class/project name, using more advanced queries compared to the default VS Code search.
+- **Advanced Tools**: allows you to filter tests by class/project name, using more advanced queries compared to the default VS Code search, and to show/hide tests by result through the filter button next to the search box.
   - **Save As Playlist**: saves the currently visible tests in the Test Explorer in a .playlist file. Useful for keeping track, saving, and sharing test runs.
+  - **Export Screenshot**: exports an image of the visible test results.
+  - **Selected Solution / All Solutions**: when more than one solution is loaded, this switch picks what the filters and the export buttons apply to. "All Solutions" applies the filters to every loaded solution, exports tests from all of them to a playlist, and pre-selects every solution in the Export Screenshot menu (that menu keeps its own solution selection, which stays authoritative for the export). Note that the filters also hide tests inside the screenshot, on top of the menu's own result options.
 - **Solution Manager**: load one or more .NET Solutions and run its tests. Tests from multiple solutions can be executed in the same test run. Each solution has its own settings:
     - **Playlist**: select a .playlist file, following the Visual Studio syntax, and filter the tests according to it.
     - **Runsettings**: by default, the default `.runsettings` file next to the solution is loaded. You can select any custom `.runsettings` file with "Select Runsettings File", or revert to the default file with "Use Default File". Overrides are always active and solution-specific: when switching runsettings files or loading a solution, permanent overrides remain while non-permanent overrides update to the file's values.

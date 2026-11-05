@@ -1,6 +1,6 @@
 ---
 name: dotnet-testing-plus
-description: View and control the .NET Testing+ VS Code extension from an agent. Discover open VS Code sessions and their loaded .NET solutions, list tests, select or clear Visual Studio .playlist files, set text filters, run or debug tests, cancel runs, edit runsettings, and read live per-test results and extension logs over a shared local HTTP control API. Use whenever the user asks to run, debug, inspect, or cancel .NET tests or playlists through the .NET Testing+ extension (the "Playlist Tests" Test Explorer workflow).
+description: View and control the .NET Testing+ VS Code extension from an agent. Discover open VS Code sessions and their loaded .NET solutions, list tests, select or clear Visual Studio .playlist files, set text filters, run or debug tests, cancel runs, edit runsettings, read live per-test results and extension logs, and page through the complete captured stdout/stderr/TRX of runs that failed, over a shared local HTTP control API. Use whenever the user asks to run, debug, inspect, or cancel .NET tests or playlists through the .NET Testing+ extension (the "Playlist Tests" Test Explorer workflow).
 ---
 
 # .NET Testing+ control API
@@ -54,12 +54,15 @@ Please note the `/api` prefix and the `/<session>` (and, for solution-scoped cal
 | GET | `/api/sessions` | — | List open sessions and, for each, its solutions (ids, labels, test counts, readiness) |
 | GET | `/api/<session>/events[?token=<token>]` | — | Server-Sent Events stream: `state`, `testState`, `runStart`, `runEnd` for that session |
 | GET | `/api/<session>/state` | — | Solutions (id/label/path/ready/loading/testCount/playlistPath), active solution, `runInProgress`, the VS Code text filter, per-state result counts, playlist not-found tests, runsettings mode/path |
-| GET | `/api/<session>/log?lines=200` | — | Recent extension output lines for that session's window |
+| GET | `/api/<session>/log?lines=200` | — | Recent extension output lines for that session's window (a capped in-memory window; the full record is in run diagnostics below) |
+| GET | `/api/<session>/runs` | — | Runs that did not pass and kept their diagnostics: `runId`, `kind` (`build`/`tests`), `status`, `solutionPath`, `projectPath`, `failureCount`, `startedAt`, `finishedAt`, `directory`, `totalBytes` |
+| GET | `/api/<session>/runs/<runId>` | — | One run's manifest: command, timestamps, status and the artifact list with sizes |
+| GET | `/api/<session>/runs/<runId>/<artifact>?offset=0&limit=65536` | — | One page of a retained artifact (`stdout.log`, `stderr.log`, `run.log`, `stream.jsonl`, `results-N.trx`): `{offset,nextOffset,eof,totalBytes,text}`. Keep reading from `nextOffset` until `eof` |
 | POST | `/api/<session>/run` | `{"all":true}` or `{"fqns":["Ns.C.M"]}` | Start a run; replies `{started, matched, missing}`. `{"all":true}` runs the tree-visible tests; `{"fqns":[...]}` runs exactly those (need not be tree-visible). Add `"debug":true` to debug, `"solution":"<solution-id>"` to scope an `all` run |
 | POST | `/api/<session>/cancel` | `{}` or `{"loading":true}` | Cancel the latest tracked run (UI- or API-started); `{"loading":true}` also cancels discovery |
 | POST | `/api/<session>/filter` | `{"text":"class:X & (project:Y|class:Z)"}` | Set the VS Code text filter (`""` clears it); narrows the Test Explorer tree, not the test lists |
 | POST | `/api/<session>/screenshot` | `{"fqns":["Ns.C.M"],"groupBy":"project"}` | Render a structured test-result snapshot for exactly the requested tests |
-| GET | `/api/<session>/<solution>/tests` | — | Every discovered test in that solution with its current state: `fqn`, `name`, `class`, `project`, `state`, `durationMs`, `file`, `line` |
+| GET | `/api/<session>/<solution>/tests` | — | Every discovered test in that solution with its current state: `fqn`, `name`, `class`, `project`, `state`, `durationMs`, `file`, `line`, `verified` |
 | GET | `/api/<session>/<solution>/code?fqn=<fqn>` | — | Source code of a specific test method |
 | POST | `/api/<session>/<solution>/playlist` | `{"path":"/abs/file.playlist"}` or `{"clear":true}` | Select or clear a Visual Studio `.playlist` file in the VS Code tree; replies with matched/not-found counts |
 | POST | `/api/<session>/<solution>/select` | `{}` | Switch the VS Code active solution tab to this solution |
@@ -76,7 +79,8 @@ Please note the `/api` prefix and the `/<session>` (and, for solution-scoped cal
 4. **Start**: `POST /api/<session>/run` with `{"all":true}` or specific `{"fqns":[...]}`. It returns immediately; a full run can take minutes.
 5. **Poll**: `GET /api/<session>/<solution>/tests` every ~2 seconds (or `GET /api/<session>/state` for `runInProgress`) until no test has state `queued` or `running`.
 6. **Report**: counts per state, then failures with `file`/`line` and `durationMs`. Use `GET /api/<session>/log` if results look wrong or a run stalled.
-7. **Stop**: `POST /api/<session>/cancel` if the user asks to abort.
+7. **Deep diagnosis (optional)**: `GET /api/<session>/runs` lists runs that did not pass. For a run, read its manifest and then page through `stdout.log` / `stderr.log` / `results-N.trx` until `eof`. These are the **complete** streams: untruncated stack frames, paths and output far beyond the 200-line log window.
+8. **Stop**: `POST /api/<session>/cancel` if the user asks to abort.
 
 ## Gotchas
 
@@ -129,4 +133,24 @@ curl -s -X POST http://127.0.0.1:48265/api/product/filter \
 
 # Cancel the current run
 curl -s -X POST http://127.0.0.1:48265/api/product/cancel -H "Content-Type: application/json" -d '{}'
+
+# Read a failing run's full stdout (page until eof)
+curl -s http://127.0.0.1:48265/api/product/runs
+curl -s http://127.0.0.1:48265/api/product/runs/20261104-153012-tests-e2e-login
+curl -s 'http://127.0.0.1:48265/api/product/runs/20261104-153012-tests-e2e-login/stdout.log?offset=0&limit=65536'
 ```
+
+## Run diagnostics on disk
+
+Runs that do not pass (test failures, errors, cancellations) keep their complete
+diagnostics in extension storage, `<storage>/diagnostics/<runId>/`:
+`stdout.log`, `stderr.log`, `run.log` (extension log lines from that run),
+`stream.jsonl` (per-test results), `results-N.trx` and `manifest.json`. Nothing is
+written into the workspace and nothing is kept for a passing run.
+
+`dotnetTestingPlus.diagnostics.retainRuns` (default 20), `.retainTotalMb`
+(default 200) and `.retainDays` (default 14) bound what is kept; the newest run
+is never pruned. `retainRuns: 0` disables retention — the log then caps each
+chunk at 64 KB with an explicit "`N chars omitted`" marker. Output can contain
+secrets, so keep the bounds in mind and delete retained runs with the
+"Delete Retained Run Diagnostics" command when they are no longer needed.
