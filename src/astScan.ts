@@ -187,17 +187,17 @@ export async function buildMethodIndex(
               scanned.markAstBroken(signature);
             }
           }
-          const missVersion = parser ? AST_VERSION : REGEX_VERSION;
-          methods = extractFile(parser, item.content ?? '', item.file);
+          const extraction = extractFile(parser, item.content ?? '', item.file);
+          methods = extraction.methods;
           scanned.set(
             item.file,
             item.stat.mtimeMs,
             item.stat.size,
             item.hash ?? contentHash(item.content ?? ''),
-            missVersion,
+            extraction.version,
             methods
           );
-          lastMissVersion = missVersion;
+          lastMissVersion = extraction.version;
         }
         foldMethods(methods, item.file, csprojPath, methodIndex, locations, projects);
         if (Date.now() - lastYield >= YIELD_BUDGET_MS) {
@@ -223,18 +223,27 @@ export async function buildMethodIndex(
   return { methodIndex, locations, projects, parserVersion: lastMissVersion };
 }
 
+/** Extraction result plus the extractor that produced it, which keys the cache. */
+interface Extraction {
+  methods: ExtractedMethod[];
+  version: string;
+}
+
 /**
  * Extract one file's test methods. Files without any test marker word are
  * known-empty (no parse needed). A parser fault on a single file degrades to
- * the regex extractor for that file instead of failing the whole scan.
+ * the regex extractor for that file instead of failing the whole scan — and the
+ * result is cached under the regex version, so a faulty parse is never served
+ * later as if the AST had produced it.
  */
-function extractFile(parser: Parser | null, content: string, file: string): ExtractedMethod[] {
+function extractFile(parser: Parser | null, content: string, file: string): Extraction {
   if (!mayContainTests(content)) {
-    return [];
+    // Nothing to extract: either version describes the same (empty) result.
+    return { methods: [], version: parser ? AST_VERSION : REGEX_VERSION };
   }
   if (parser) {
     try {
-      return extractMethodsAst(parser, content);
+      return { methods: extractMethodsAst(parser, content), version: AST_VERSION };
     } catch (err) {
       if (loggedAstFailures++ < MAX_LOGGED_AST_FAILURES) {
         log(`AST scan failed for ${file}, using regex for this file: ${err instanceof Error ? err.message : String(err)}`);
@@ -246,7 +255,7 @@ function extractFile(parser: Parser | null, content: string, file: string): Extr
       }
     }
   }
-  return extractMethodsRegex(content);
+  return { methods: extractMethodsRegex(content), version: REGEX_VERSION };
 }
 
 function extractMethodsAst(parser: Parser, content: string): ExtractedMethod[] {

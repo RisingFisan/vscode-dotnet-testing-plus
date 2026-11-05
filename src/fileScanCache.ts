@@ -123,6 +123,30 @@ function sameMethods(before: [string, string, number][] | undefined, after: [str
 }
 
 /**
+ * Whether `value` is a plain record. A hand-edited or truncated store with the
+ * right schema tag but the wrong shape must not be trusted: a string where the
+ * maps belong would make every later `set()` throw and brick all scans.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Tuples that can be materialized; anything else in a corrupt record is dropped. */
+function validTuples(value: unknown): [string, string, number][] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (tuple): tuple is [string, string, number] =>
+      Array.isArray(tuple) &&
+      tuple.length === 3 &&
+      typeof tuple[0] === 'string' &&
+      typeof tuple[1] === 'string' &&
+      typeof tuple[2] === 'number'
+  );
+}
+
+/**
  * Scan cache keyed by absolute file path, with extraction results stored by
  * content hash rather than by path.
  *
@@ -154,8 +178,10 @@ export class FileScanCache {
       try {
         const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
         if (parsed && typeof parsed === 'object' && parsed.schema === STORE_SCHEMA) {
-          this.files = parsed.files ?? {};
-          this.content = parsed.content ?? {};
+          // Shape-validate: a corrupt store must degrade to "cold" (one full
+          // scan), never to exceptions on every later write.
+          this.files = isRecord(parsed.files) ? (parsed.files as Record<string, FileRecord>) : {};
+          this.content = isRecord(parsed.content) ? (parsed.content as Record<string, ContentRecord>) : {};
         }
       } catch {
         // Missing, corrupt or older-schema cache: start fresh, same as SolutionCache.
@@ -184,7 +210,7 @@ export class FileScanCache {
     if (cached) {
       return cached;
     }
-    const methods = record.t.map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
+    const methods = validTuples(record.t).map(([bare, fullyQualifiedName, line]) => ({ bare, fullyQualifiedName, line }));
     this.materialized.set(record, methods);
     return methods;
   }

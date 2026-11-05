@@ -64,6 +64,30 @@ export interface CompileExcludes {
   unresolved: string[];
 }
 
+/** XML comments and conditional item groups, which MSBuild may not apply at all. */
+const XML_COMMENT_RE = /<!--[\s\S]*?-->/g;
+const ITEM_GROUP_RE = /<ItemGroup\b([^>]*)>([\s\S]*?)<\/ItemGroup>/g;
+const CONDITION_RE = /\bCondition\s*=/i;
+const COMPILE_TAG_RE = /<Compile\b([^>]*)>/g;
+
+/**
+ * `<Compile>` attribute lists MSBuild would actually evaluate: a commented-out
+ * item is dead, and an item group with a `Condition` may not apply to the build
+ * we are scanning. Ignoring both keeps the scan from hiding a test the compiler
+ * really compiled, which is the expensive direction to be wrong in.
+ */
+function* evaluatedCompileAttributes(csprojText: string): Generator<string> {
+  const text = csprojText.replace(XML_COMMENT_RE, '');
+  for (const group of text.matchAll(ITEM_GROUP_RE)) {
+    if (CONDITION_RE.test(group[1])) {
+      continue;
+    }
+    for (const item of group[2].matchAll(COMPILE_TAG_RE)) {
+      yield item[1];
+    }
+  }
+}
+
 /**
  * Files a project explicitly excludes from compilation (`<Compile Remove>` and
  * `<Compile Include ... Exclude>`), read straight from the project file text.
@@ -73,8 +97,8 @@ export interface CompileExcludes {
  */
 export function parseCompileExcludes(csprojText: string): CompileExcludes {
   const patterns = new Set<string>();
-  for (const item of csprojText.matchAll(/<Compile\b([^>]*)>/g)) {
-    for (const attr of item[1].matchAll(/(\w+)\s*=\s*"([^"]*)"/g)) {
+  for (const attributes of evaluatedCompileAttributes(csprojText)) {
+    for (const attr of attributes.matchAll(/(\w+)\s*=\s*"([^"]*)"/g)) {
       const attribute = attr[1].toLowerCase();
       if (attribute !== 'remove' && attribute !== 'exclude') {
         continue;
