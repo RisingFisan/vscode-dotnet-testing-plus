@@ -10,12 +10,15 @@ import { InputSummary, summarizeBuildInputs } from './buildInputs';
  * cannot vouch for, so it invalidates the stamp. `count` catches files being
  * added or removed, which a timestamp comparison alone cannot see. `projects`
  * records what the build covered: a slice build cannot vouch for the projects
- * it did not include.
+ * it did not include. `configuration` records what the outputs were built for,
+ * so a different configuration can never reuse another one's stamp.
  */
 export interface BuildStamp extends InputSummary {
   builtAt: number;
   /** Test projects the build covered, or `null` when it built the whole solution. */
   projects: string[] | null;
+  /** Build configuration the outputs were produced for (we always build Debug). */
+  configuration: string;
 }
 
 /**
@@ -27,7 +30,7 @@ export interface BuildStamp extends InputSummary {
  */
 export type BuildState = 'current' | 'coverage' | 'inputs' | 'unknown';
 
-const STORE_VERSION = 2;
+const STORE_VERSION = 3;
 const stamps = new Map<string, BuildStamp>();
 let storeFile: string | undefined;
 
@@ -67,6 +70,7 @@ function isStamp(value: unknown): value is BuildStamp {
   return typeof stamp.builtAt === 'number' &&
     typeof stamp.count === 'number' &&
     typeof stamp.newestMtimeMs === 'number' &&
+    typeof stamp.configuration === 'string' &&
     (stamp.projects === null ||
       (Array.isArray(stamp.projects) && stamp.projects.every(project => typeof project === 'string')));
 }
@@ -98,6 +102,45 @@ export function getBuildStamp(solutionPath: string): BuildStamp | undefined {
   return stamps.get(path.resolve(solutionPath));
 }
 
+/**
+ * Whether a test project still has the assembly last built for it. The input
+ * sweep cannot see a wiped `bin`/`obj` (both are pruned, because a build
+ * rewrites them), and `dotnet test --no-build` would then fail against a stamp
+ * that still says the build is current.
+ */
+async function hasBuildOutput(projectPath: string, configuration: string): Promise<boolean> {
+  const binDir = path.join(path.dirname(projectPath), 'bin', configuration);
+  let targets: fs.Dirent[];
+  try {
+    targets = await fs.promises.readdir(binDir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const target of targets) {
+    if (!target.isDirectory()) {
+      continue;
+    }
+    try {
+      const files = await fs.promises.readdir(path.join(binDir, target.name));
+      if (files.some(name => name.endsWith('.dll'))) {
+        return true;
+      }
+    } catch {
+      // An unreadable output directory is simply not evidence of a built assembly.
+    }
+  }
+  return false;
+}
+
+async function outputsPresent(projects: readonly string[], configuration: string): Promise<boolean> {
+  for (const project of projects) {
+    if (!(await hasBuildOutput(project, configuration))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function markBuildClean(solutionPath: string, stamp: BuildStamp): void {
   stamps.set(path.resolve(solutionPath), stamp);
   persist();
@@ -111,14 +154,22 @@ export function markBuildDirty(solutionPath: string): void {
 
 /**
  * Whether the last build still covers a run of `projects`: the input set is
- * unchanged, nothing was modified at or after the build started, and every
- * requested project was built. A sweep (not the watcher) is the evidence, so a
- * missed event cannot produce a stale build.
+ * unchanged, nothing was modified at or after the build started, every
+ * requested project was built, and its assembly is still on disk. A sweep (not
+ * the watcher) is the evidence, so a missed event cannot produce a stale build.
  */
-export async function checkBuild(solutionPath: string, projects: readonly string[]): Promise<BuildState> {
+export async function checkBuild(
+  solutionPath: string,
+  projects: readonly string[],
+  configuration: string
+): Promise<BuildState> {
   const stamp = getBuildStamp(solutionPath);
   if (!stamp) {
     return 'unknown';
+  }
+  if (stamp.configuration !== configuration) {
+    markBuildDirty(solutionPath);
+    return 'inputs';
   }
   const summary = await summarizeBuildInputs(solutionPath);
   if (!summary) {
@@ -128,5 +179,14 @@ export async function checkBuild(solutionPath: string, projects: readonly string
     markBuildDirty(solutionPath);
     return 'inputs';
   }
-  return covers(stamp, projects) ? 'current' : 'coverage';
+  if (!covers(stamp, projects)) {
+    return 'coverage';
+  }
+  if (!(await outputsPresent(projects, configuration))) {
+    // bin/obj were wiped or cleaned: the sources are unchanged, but there is
+    // nothing left to run.
+    markBuildDirty(solutionPath);
+    return 'inputs';
+  }
+  return 'current';
 }

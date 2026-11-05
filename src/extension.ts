@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { parsePlaylist, serializePlaylist, expandPlaylist, entryFromKnownTestFqn, ParsedPlaylist, PlaylistSaveFormat, PlaylistTest } from './playlistParser';
-import { buildSolution, runPlaylistTests, SolutionRunOptions, TestDescriptor, TestFailureLocations } from './testRunner';
+import { BUILD_CONFIGURATION, buildSolution, runPlaylistTests, SolutionRunOptions, TestDescriptor, TestFailureLocations } from './testRunner';
 import { checkBuild, markBuildClean, markBuildDirty, configureBuildState } from './buildState';
 import { summarizeBuildInputs } from './buildInputs';
 import { SolutionCache } from './cache';
@@ -401,7 +401,7 @@ async function pickLoadedSession(
 async function canSkipBuild(solutionPath: string): Promise<boolean> {
   const session = sessions.get(solutionPath);
   const projects = session ? [...new Set(session.testProjects.values())] : [];
-  const state = await checkBuild(solutionPath, projects);
+  const state = await checkBuild(solutionPath, projects, BUILD_CONFIGURATION);
   if (state === 'inputs') {
     log(`Build inputs changed since the last build of ${path.basename(solutionPath)}; building again.`);
   }
@@ -453,7 +453,7 @@ async function rebuildSolutionNow(solutionPath: string): Promise<void> {
           await buildSolution(solutionPath, cts.token, logOutput);
           const summary = await summarizeBuildInputs(solutionPath);
           if (summary) {
-            markBuildClean(solutionPath, { ...summary, builtAt, projects: null });
+            markBuildClean(solutionPath, { ...summary, builtAt, projects: null, configuration: BUILD_CONFIGURATION });
           }
           log(`Rebuild finished: ${solutionPath}`);
           void vscode.window.showInformationMessage(`Solution built: ${name}.`);

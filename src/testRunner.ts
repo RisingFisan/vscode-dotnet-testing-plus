@@ -282,7 +282,7 @@ async function runSolutionTests(
     runsettingsPath: solution.runsettingsPath
   };
   try {
-    const state = await checkBuild(solution.solutionPath, projectPaths);
+    const state = await checkBuild(solution.solutionPath, projectPaths, BUILD_CONFIGURATION);
     if (state === 'current') {
       const message = `Skipping build (nothing changed since the last build): ${solution.solutionPath}`;
       log(message);
@@ -306,7 +306,8 @@ async function runSolutionTests(
         markBuildClean(solution.solutionPath, {
           ...summary,
           builtAt,
-          projects: fullSolution ? null : [...new Set([...(previous ?? []), ...built])]
+          projects: fullSolution ? null : [...new Set([...(previous ?? []), ...built])],
+          configuration: BUILD_CONFIGURATION
         });
       } else {
         markBuildDirty(solution.solutionPath);
@@ -758,7 +759,7 @@ function createLineFeeder(ctx: LiveContext, resultFiles: string[]): LineFeeder {
 // (before the common targets default it to Debug), so without an explicit
 // value the output path bakes to a flat `bin/` the build never populated
 // ("The argument <dll> is invalid"). Build and test must always agree.
-const BUILD_CONFIGURATION = 'Debug';
+export const BUILD_CONFIGURATION = 'Debug';
 
 export type BuildOutput = (text: string, stream: 'stdout' | 'stderr') => void;
 
