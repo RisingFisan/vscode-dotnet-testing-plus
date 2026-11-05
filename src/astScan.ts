@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Parser, Language, Node } from 'web-tree-sitter';
 import { log } from './logger';
-import { SourceLocation, extractMethodsRegex, walkCsFilesAsync } from './sourceScan';
+import { SourceLocation, extractMethodsRegex, walkCsFilesAsync, isExcludedFromCompile, readCompileExcludes } from './sourceScan';
 import { TEST_ATTRIBUTES, mayContainTests } from './testAttributes';
 import { ExtractedMethod, FileScanCache, contentHash, foldMethods } from './fileScanCache';
 
@@ -53,6 +53,7 @@ const SCAN_CHUNK = 64;
 const YIELD_BUDGET_MS = 8;
 const MAX_LOGGED_AST_FAILURES = 3;
 let loggedAstFailures = 0;
+let loggedUnresolvedExcludes = false;
 
 function yieldToHost(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
@@ -119,6 +120,7 @@ export async function buildMethodIndex(
   // Directories already listed by an earlier project root; nested or
   // overlapping project directories would otherwise re-walk entire subtrees.
   const visitedDirs = new Set<string>();
+  const unresolvedExcludes = new Set<string>();
   let lastYield = Date.now();
 
   const loadFile = async (file: string): Promise<LoadedFile | undefined> => {
@@ -150,7 +152,15 @@ export async function buildMethodIndex(
       continue;
     }
     scannedRoots.push(root);
-    const fresh = files.filter(file => !seen.has(file));
+    // The walk is directory-based, so a file the project removes from
+    // compilation (`<Compile Remove>`) would otherwise contribute tests that
+    // the test host never reports. Cheap to read per scan: the project file
+    // text carries the patterns, and no MSBuild evaluation is involved.
+    const excludes = await readCompileExcludes(csprojPath);
+    excludes.unresolved.forEach(pattern => unresolvedExcludes.add(`${path.basename(csprojPath)}: ${pattern}`));
+    const fresh = files
+      .filter(file => !isExcludedFromCompile(path.relative(root, file), excludes))
+      .filter(file => !seen.has(file));
     fresh.forEach(file => seen.add(file));
 
     for (let i = 0; i < fresh.length; i += SCAN_CHUNK) {
@@ -196,6 +206,14 @@ export async function buildMethodIndex(
         }
       }
     }
+  }
+
+  if (unresolvedExcludes.size > 0 && !loggedUnresolvedExcludes) {
+    loggedUnresolvedExcludes = true;
+    log(
+      `Ignored ${unresolvedExcludes.size} compile exclude pattern(s) requiring MSBuild evaluation: ` +
+        [...unresolvedExcludes].slice(0, 3).join('; ')
+    );
   }
 
   // Forget cache entries for deleted/renamed files, only under directories

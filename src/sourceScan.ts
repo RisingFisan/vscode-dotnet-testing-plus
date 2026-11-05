@@ -24,6 +24,95 @@ function isSkippedDir(name: string): boolean {
   return SKIP_DIRS.has(name);
 }
 
+/** MSBuild paths are backslash-separated even when the build runs on Unix. */
+function normalizeSeparators(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+/**
+ * Translate one MSBuild item glob into a matcher for a normalised relative
+ * path. `**` spans directories, `*` and `?` stay within a segment — the subset
+ * of MSBuild globbing that `Compile Remove`/`Exclude` actually uses. Matching
+ * is case-sensitive, as MSBuild item matching is on Unix.
+ */
+function globToRegExp(pattern: string): RegExp {
+  let source = '^';
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (char === '*') {
+      if (pattern[i + 1] === '*') {
+        source += '.*';
+        i++;
+        if (pattern[i + 1] === '/') {
+          i++;
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else if (char === '?') {
+      source += '[^/]';
+    } else {
+      source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+export interface CompileExcludes {
+  matchers: RegExp[];
+  /** Patterns that need an MSBuild evaluation (property references) and are ignored. */
+  unresolved: string[];
+}
+
+/**
+ * Files a project explicitly excludes from compilation (`<Compile Remove>` and
+ * `<Compile Include ... Exclude>`), read straight from the project file text.
+ * They matter because the walk is directory-based: a `.cs` file kept in the
+ * tree but removed from the project still parses as a test, which shows up as a
+ * test that the test host never reports.
+ */
+export function parseCompileExcludes(csprojText: string): CompileExcludes {
+  const patterns = new Set<string>();
+  for (const item of csprojText.matchAll(/<Compile\b([^>]*)>/g)) {
+    for (const attr of item[1].matchAll(/(\w+)\s*=\s*"([^"]*)"/g)) {
+      const attribute = attr[1].toLowerCase();
+      if (attribute !== 'remove' && attribute !== 'exclude') {
+        continue;
+      }
+      for (const part of attr[2].split(';')) {
+        const trimmed = part.trim();
+        if (trimmed) {
+          patterns.add(trimmed);
+        }
+      }
+    }
+  }
+  const matchers: RegExp[] = [];
+  const unresolved: string[] = [];
+  for (const pattern of patterns) {
+    if (pattern.includes('$(')) {
+      unresolved.push(pattern);
+      continue;
+    }
+    matchers.push(globToRegExp(normalizeSeparators(pattern)));
+  }
+  return { matchers, unresolved };
+}
+
+export async function readCompileExcludes(csprojPath: string): Promise<CompileExcludes> {
+  try {
+    return parseCompileExcludes(await fs.promises.readFile(csprojPath, 'utf8'));
+  } catch {
+    return { matchers: [], unresolved: [] };
+  }
+}
+
+/** True when `relativePath` (project-relative) is excluded from compilation. */
+export function isExcludedFromCompile(relativePath: string, excludes: CompileExcludes): boolean {
+  const normalized = normalizeSeparators(relativePath);
+  return excludes.matchers.some(matcher => matcher.test(normalized));
+}
+
 /**
  * Async listing of every .cs file under `dir`, in readdir order: each entry
  * maps to its own file-or-subtree list and the lists are flattened back in
